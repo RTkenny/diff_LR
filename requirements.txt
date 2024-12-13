@@ -1,0 +1,14 @@
+torch
+accelerate
+diffusers
+wandb
+ipdb
+torchvision
+transformers==4.46.3
+hpsv2x==1.2.0
+inflect
+pydantic
+trl
+absl-py
+ml-collections
+git+https://github.com/openai/CLIP.git
