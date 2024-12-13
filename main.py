@@ -9,8 +9,8 @@ import prompts as prompts_file
 import numpy as np
 from transformers import HfArgumentParser
 
-from config.alignprop_config import AlignPropConfig
-from alignprop_trainer import AlignPropTrainer
+from config.rlr_config import RLR_Config
+from rlr_trainer import RLR_Trainer
 from sd_pipeline import DiffusionPipeline
 from trl.models.auxiliary_modules import aesthetic_scorer
 
@@ -41,7 +41,7 @@ def image_outputs_logger(image_pair_data, global_step, accelerate_logger):
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, AlignPropConfig))
+    parser = HfArgumentParser((ScriptArguments, RLR_Config))
     script_args, training_args = parser.parse_args_into_dataclasses()
     project_dir = f"alignprop_{int(time.time())}"
     os.makedirs(f"checkpoints/{project_dir}", exist_ok=True)
@@ -60,7 +60,7 @@ if __name__ == "__main__":
         pretrained_model_revision=script_args.pretrained_revision,
         use_lora=script_args.use_lora,
     )
-    trainer = AlignPropTrainer(
+    trainer = RLR_Trainer(
         training_args,
         prompt_fn,
         pipeline,

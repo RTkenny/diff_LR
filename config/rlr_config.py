@@ -10,7 +10,7 @@ from trl.core import flatten_dict
 
 
 @dataclass
-class AlignPropConfig:
+class RLR_Config:
     r"""
     Configuration class for the [`AlignPropTrainer`].
 
@@ -108,7 +108,7 @@ class AlignPropConfig:
     sample_eta: float = 1.0
     sample_guidance_scale: float = 5.0
     prompt_fn: str = 'simple_animals'
-    gradient_estimation_strategy: str = 'gaussian'    # gaussian, uniform, fixed, LR
+    gradient_estimation_strategy: str = 'gaussian'    # gaussian, uniform, fixed, LR, RL
     backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 49}, 'LR':{None}}
     
     train_batch_size: int = 1

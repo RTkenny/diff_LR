@@ -16,8 +16,8 @@ import hpsv2
 from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
 import torchvision
 from sd_pipeline import DiffusionPipeline
-from config.alignprop_config import AlignPropConfig
-from trl.trainer import BaseTrainer
+from config.rlr_config import RLR_Config
+from trl.trainer import BaseTrainer, DDPOTrainer, AlignPropTrainer
 
 
 if is_wandb_available():
@@ -131,7 +131,7 @@ def aesthetic_loss_fn(aesthetic_target=None,
     return loss_fn
 
 
-class AlignPropTrainer(BaseTrainer):
+class RLR_Trainer(BaseTrainer):
     """
     The AlignPropTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
     Note, this trainer is heavily inspired by the work here: https://github.com/mihirp1998/AlignProp/
@@ -154,7 +154,7 @@ class AlignPropTrainer(BaseTrainer):
 
     def __init__(
         self,
-        config: AlignPropConfig,
+        config: RLR_Config,
         prompt_function: Callable[[], Tuple[str, Any]],
         sd_pipeline: DiffusionPipeline,
         image_samples_hook: Optional[Callable[[Any, Any, Any], Any]] = None,
@@ -317,26 +317,26 @@ class AlignPropTrainer(BaseTrainer):
 
         for _ in range(self.config.train_gradient_accumulation_steps):
             with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
-                samples = self._generate_samples(
+                samples, prompt_image_pairs = self._generate_samples(
                     batch_size=self.config.train_batch_size,
                 )
 
                 if "hps" in self.config.reward_fn:
-                    loss, rewards = self.loss_fn(samples["images"], samples["prompts"])
+                    loss, rewards = self.loss_fn(prompt_image_pairs["images"], prompt_image_pairs["prompts"])
                 else:
-                    loss, rewards = self.loss_fn(samples["images"])
+                    loss, rewards = self.loss_fn(prompt_image_pairs["images"])
 
                 rewards_vis = self.accelerator.gather(rewards).detach().cpu().numpy()
-                loss =  loss.mean()
+                loss = loss.mean()
                 loss = loss * self.config.loss_coeff
                 
                 if self.config.gradient_estimation_strategy != "LR":
                     self.accelerator.backward(loss)
                 else:
                     loss = loss.detach()
-                    log_probs = samples["all_log_probs"]
-                    loss_target = torch.mean(loss*torch.stack(log_probs).sum())
-                    self.accelerator.backward(-loss_target)
+                    log_probs = samples["log_probs"]
+                    loss_target = torch.mean(loss*log_probs.sum())
+                    self.accelerator.backward(loss_target)
 
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(
@@ -420,9 +420,13 @@ class AlignPropTrainer(BaseTrainer):
             with_grad (bool): Whether the generated RGBs should have gradients attached to it.
 
         Returns:
-            prompt_image_pairs (Dict[Any])
+            
         """
-        samples = {}
+        # original code
+        # samples = {}
+
+        samples = []
+        prompt_image_pairs = []
 
         sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
 
@@ -463,12 +467,37 @@ class AlignPropTrainer(BaseTrainer):
             )
 
         images = sd_output.images
-        samples["images"] = images
-        samples["prompts"] = prompts
-        samples["prompt_metadata"] = prompt_metadata
-        samples["all_log_probs"] = sd_output.log_probs
+        latents = sd_output.latents
+        log_probs = sd_output.log_probs
 
-        return samples
+        latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
+        log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+        timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
+
+        samples.append(
+            {
+                "prompt_ids": prompt_ids,
+                "prompt_embeds": prompt_embeds,
+                "timesteps": timesteps,
+                "latents": latents[:, :-1],  # each entry is the latent before timestep t
+                "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
+                "log_probs": log_probs,
+                "negative_prompt_embeds": sample_neg_prompt_embeds,
+            }
+        )
+        prompt_image_pairs.append([images, prompts, prompt_metadata])
+
+        return samples, prompt_image_pairs
+
+        # orignial code
+        # images = sd_output.images
+        # samples["images"] = images
+        # samples["prompts"] = prompts
+        # samples["prompt_metadata"] = prompt_metadata
+        # samples["all_log_probs"] = sd_output.log_probs
+
+        # return samples
+        
 
     def train(self, epochs: Optional[int] = None):
         """
