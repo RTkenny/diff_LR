@@ -18,7 +18,7 @@ from trl.models.auxiliary_modules import aesthetic_scorer
 @dataclass
 class ScriptArguments:
     pretrained_model: str = field(
-        default="/home/rt/data/SD_playground/CompVis/stable-diffusion-v1-4", metadata={"help": "the pretrained model to use"} # "runwayml/stable-diffusion-v1-5" original
+        default="/home/rt/data/SD_playground/CompVis/stable-diffusion-v1-4", metadata={"help": "the pretrained model to use"} # "runwayml/stable-diffusion-v1-5" original /root/autodl-tmp/CompVis/stable-diffusion-v1-4
     )
     pretrained_revision: str = field(default="main", metadata={"help": "the pretrained model revision to use"})
     use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})

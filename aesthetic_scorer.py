@@ -30,7 +30,7 @@ class MLPDiff(nn.Module):
 class AestheticScorerDiff(torch.nn.Module):
     def __init__(self, dtype):
         super().__init__()
-        self.clip = CLIPModel.from_pretrained("/home/rt/data/SD_playground/openai/clip-vit-large-patch14")
+        self.clip = CLIPModel.from_pretrained("/home/rt/data/SD_playground/openai/clip-vit-large-patch14") #/root/autodl-tmp/openai/clip-vit-large-patch14
         self.mlp = MLPDiff()
         state_dict = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"))
         self.mlp.load_state_dict(state_dict)
