@@ -321,6 +321,8 @@ class RLR_Trainer(BaseTrainer):
                     batch_size=self.config.train_batch_size,
                 )
 
+                samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+
                 if "hps" in self.config.reward_fn:
                     loss, rewards = self.loss_fn(prompt_image_pairs["images"], prompt_image_pairs["prompts"])
                 else:
@@ -372,10 +374,10 @@ class RLR_Trainer(BaseTrainer):
             torch.manual_seed(self.config.seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.config.seed)
-            samples_eval = self._generate_samples(
+            _, prompt_image_pairs = self._generate_samples(
                     batch_size=self.config.train_batch_size, with_grad=False, prompts=self.eval_prompts
                 )
-            self.image_samples_callback(samples_eval, global_step, self.accelerator.trackers[0])
+            self.image_samples_callback(prompt_image_pairs, global_step, self.accelerator.trackers[0])
             seed = random.randint(0, 100)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
@@ -426,7 +428,8 @@ class RLR_Trainer(BaseTrainer):
         # samples = {}
 
         samples = []
-        prompt_image_pairs = []
+        # prompt_image_pairs = []
+        prompt_image_pairs = {}
 
         sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
 
@@ -485,7 +488,10 @@ class RLR_Trainer(BaseTrainer):
                 "negative_prompt_embeds": sample_neg_prompt_embeds,
             }
         )
-        prompt_image_pairs.append([images, prompts, prompt_metadata])
+        # prompt_image_pairs.append([images, prompts, prompt_metadata])
+        prompt_image_pairs["images"] = images
+        prompt_image_pairs["prompts"] = prompts
+        prompt_image_pairs["prompt_metadata"] = prompt_metadata
 
         return samples, prompt_image_pairs
 
