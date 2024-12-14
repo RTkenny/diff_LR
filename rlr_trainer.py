@@ -293,6 +293,186 @@ class RLR_Trainer(BaseTrainer):
         
         self.eval_prompts, self.eval_prompt_metadata = zip(*[self.prompt_fn() for _ in range(config.train_batch_size)])
 
+    def reward_fn_RL(self, images, prompts, prompt_metadata):
+        """
+        Compute the reward for a given image and prompt
+
+        Args:
+            images (torch.Tensor):
+                The images to compute the reward for, shape: [batch_size, 3, height, width]
+            prompts (Tuple[str]):
+                The prompts to compute the reward for
+            prompt_metadata (Tuple[Any]):
+                The metadata associated with the prompts
+
+        Returns:
+            reward (torch.Tensor), reward_metadata (Any)
+        """
+        if self.config.reward_fn == "hps":
+            loss, rewards = self.loss_fn(images, prompts)
+            return rewards, {}
+        elif self.config.reward_fn == "aesthetic":
+            loss, rewards = self.loss_fn(images)
+            return rewards, {}
+        else:
+            raise NotImplementedError
+
+    def compute_rewards(self, prompt_image_pairs, is_async=False):
+        rewards = []
+        for images, prompts, prompt_metadata in prompt_image_pairs:
+            reward, reward_metadata = self.reward_fn_RL(images, prompts, prompt_metadata)
+            rewards.append(
+                (
+                    torch.as_tensor(reward, device=self.accelerator.device),
+                    reward_metadata,
+                )
+            )
+        return zip(*rewards)
+    
+    def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
+        """
+        Calculate the loss for a batch of an unpacked sample
+
+        Args:
+            latents (torch.Tensor):
+                The latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            timesteps (torch.Tensor):
+                The timesteps sampled from the diffusion model, shape: [batch_size]
+            next_latents (torch.Tensor):
+                The next latents sampled from the diffusion model, shape: [batch_size, num_channels_latents, height, width]
+            log_probs (torch.Tensor):
+                The log probabilities of the latents, shape: [batch_size]
+            advantages (torch.Tensor):
+                The advantages of the latents, shape: [batch_size]
+            embeds (torch.Tensor):
+                The embeddings of the prompts, shape: [2*batch_size or batch_size, ...]
+                Note: the "or" is because if train_cfg is True, the expectation is that negative prompts are concatenated to the embeds
+
+        Returns:
+            loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
+            (all of these are of shape (1,))
+        """
+        with self.autocast():
+            if self.config.train_cfg:
+                noise_pred = self.sd_pipeline.unet(
+                    torch.cat([latents] * 2),
+                    torch.cat([timesteps] * 2),
+                    embeds,
+                ).sample
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+            else:
+                noise_pred = self.sd_pipeline.unet(
+                    latents,
+                    timesteps,
+                    embeds,
+                ).sample
+            # compute the log prob of next_latents given latents under the current model
+
+            scheduler_step_output = self.sd_pipeline.scheduler_step(
+                noise_pred,
+                timesteps,
+                latents,
+                eta=self.config.sample_eta,
+                prev_sample=next_latents,
+            )
+
+            log_prob = scheduler_step_output.log_probs
+
+        advantages = torch.clamp(
+            advantages,
+            -self.config.train_adv_clip_max,
+            self.config.train_adv_clip_max,
+        )
+
+        ratio = torch.exp(log_prob - log_probs)
+
+        loss = self.loss(advantages, self.config.train_clip_range, ratio)
+
+        approx_kl = 0.5 * torch.mean((log_prob - log_probs) ** 2)
+
+        clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.config.train_clip_range).float())
+
+        return loss, approx_kl, clipfrac
+
+    def loss(
+        self,
+        advantages: torch.Tensor,
+        clip_range: float,
+        ratio: torch.Tensor,
+    ):
+        unclipped_loss = -advantages * ratio
+        clipped_loss = -advantages * torch.clamp(
+            ratio,
+            1.0 - clip_range,
+            1.0 + clip_range,
+        )
+        return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+    
+    def _train_batched_samples(self, inner_epoch, epoch, global_step, batched_samples):
+        """
+        Train on a batch of samples. Main training segment
+
+        Args:
+            inner_epoch (int): The current inner epoch
+            epoch (int): The current epoch
+            global_step (int): The current global step
+            batched_samples (List[Dict[str, torch.Tensor]]): The batched samples to train on
+
+        Side Effects:
+            - Model weights are updated
+            - Logs the statistics to the accelerator trackers.
+
+        Returns:
+            global_step (int): The updated global step
+        """
+        info = defaultdict(list)
+        for _i, sample in enumerate(batched_samples):
+            if self.config.train_cfg:
+                # concat negative prompts to sample prompts to avoid two forward passes
+                embeds = torch.cat([sample["negative_prompt_embeds"], sample["prompt_embeds"]])
+            else:
+                embeds = sample["prompt_embeds"]
+
+            self.num_train_timesteps = int(self.config.sample_num_steps * self.config.timestep_fraction)
+            for j in range(self.num_train_timesteps):
+                with self.accelerator.accumulate(self.sd_pipeline.unet):
+                    loss, approx_kl, clipfrac = self.calculate_loss(
+                        sample["latents"][:, j],
+                        sample["timesteps"][:, j],
+                        sample["next_latents"][:, j],
+                        sample["log_probs"][:, j],
+                        sample["advantages"],
+                        embeds,
+                    )
+                    info["approx_kl"].append(approx_kl)
+                    info["clipfrac"].append(clipfrac)
+                    info["loss"].append(loss)
+
+                    self.accelerator.backward(loss)
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.trainable_layers.parameters()
+                            if not isinstance(self.trainable_layers, list)
+                            else self.trainable_layers,
+                            self.config.train_max_grad_norm,
+                        )
+                    # print(f'{j}_times')
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if self.accelerator.sync_gradients:
+                    # log training-related stuff
+                    info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+                    info = self.accelerator.reduce(info, reduction="mean")
+                    info.update({"epoch": epoch, "inner_epoch": inner_epoch})
+                    self.accelerator.log(info, step=global_step)
+                    global_step += 1
+                    info = defaultdict(list)
+        return global_step
 
     def step(self, epoch: int, global_step: int):
         """
@@ -317,43 +497,125 @@ class RLR_Trainer(BaseTrainer):
 
         for _ in range(self.config.train_gradient_accumulation_steps):
             with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
-                samples, prompt_image_pairs = self._generate_samples(
-                    batch_size=self.config.train_batch_size,
-                )
+                if self.config.gradient_estimation_strategy == "RL":
+                    with torch.no_grad():
+                        samples, prompt_image_pairs = self._generate_samples(
+                            batch_size=self.config.train_batch_size,
+                        )
+                    print("Samples generated")
+                    samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
-                samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+                    prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
+                    rewards, rewards_metadata = self.compute_rewards(prompt_image_data)
 
-                if "hps" in self.config.reward_fn:
-                    loss, rewards = self.loss_fn(prompt_image_pairs["images"], prompt_image_pairs["prompts"])
-                else:
-                    loss, rewards = self.loss_fn(prompt_image_pairs["images"])
+                    for i, image_data in enumerate(prompt_image_data):
+                        image_data.extend([rewards[i], rewards_metadata[i]])
 
-                rewards_vis = self.accelerator.gather(rewards).detach().cpu().numpy()
-                loss = loss.mean()
-                loss = loss * self.config.loss_coeff
-                
-                if self.config.gradient_estimation_strategy != "LR":
-                    self.accelerator.backward(loss)
-                else:
-                    loss = loss.detach()
-                    log_probs = samples["log_probs"]
-                    loss_target = torch.mean(loss*log_probs.sum())
-                    self.accelerator.backward(loss_target)
+                    rewards = torch.cat(rewards)
+                    rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
 
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(
-                        self.trainable_layers.parameters()
-                        if not isinstance(self.trainable_layers, list)
-                        else self.trainable_layers,
-                        self.config.train_max_grad_norm,
+                    if self.config.per_prompt_stat_tracking:
+                        # gather the prompts across processes
+                        prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+                        prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+                        advantages = self.stat_tracker.update(prompts, rewards)
+                    else:
+                        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+                    # ungather advantages;  keep the entries corresponding to the samples on this process
+                    samples["advantages"] = (
+                        torch.as_tensor(advantages)
+                        .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
+                        .to(self.accelerator.device)
                     )
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                    total_batch_size, num_timesteps = samples["timesteps"].shape
 
-            info["reward_mean"].append(rewards_vis.mean())
-            info["reward_std"].append(rewards_vis.std())
-            info["loss"].append(loss.item())
+                    for inner_epoch in range(self.config.train_num_inner_epochs):
+                        # shuffle samples along batch dimension
+                        perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+                        samples = {k: v[perm] for k, v in samples.items()}
+
+                        # shuffle along time dimension independently for each sample
+                        # still trying to understand the code below
+                        perms = torch.stack(
+                            [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
+                        )
+
+                        for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+                            samples[key] = samples[key][
+                                torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
+                                perms,
+                            ]
+
+                        original_keys = samples.keys()
+                        original_values = samples.values()
+                        # rebatch them as user defined train_batch_size is different from sample_batch_size
+                        reshaped_values = [v.reshape(-1, self.config.train_batch_size, *v.shape[1:]) for v in original_values]
+
+                        # Transpose the list of original values
+                        transposed_values = zip(*reshaped_values)
+                        # Create new dictionaries for each row of transposed values
+                        samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
+
+                        # self.sd_pipeline.unet.train()
+                        global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
+                        # ensure optimization step at the end of the inner epoch
+                        if not self.accelerator.sync_gradients:
+                            raise ValueError(
+                                "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
+                            )
+
+
+                else:
+                    samples, prompt_image_pairs = self._generate_samples(
+                            batch_size=self.config.train_batch_size,
+                        )
+                    print("Samples generated")
+                    samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+
+                    if "hps" in self.config.reward_fn:
+                        loss, rewards = self.loss_fn(prompt_image_pairs["images"], prompt_image_pairs["prompts"])
+                    else:
+                        loss, rewards = self.loss_fn(prompt_image_pairs["images"])
+
+                    rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
+                    loss = loss.mean()
+                    loss = loss * self.config.loss_coeff
+                    
+                    # if self.config.gradient_estimation_strategy != "LR":
+                    #     self.accelerator.backward(loss)
+                    # else:
+                    #     loss = loss.detach()
+                    #     log_probs = samples["log_probs"]
+                    #     loss_target = torch.mean(loss*log_probs.sum())
+                    #     self.accelerator.backward(loss_target)
+
+                    if self.config.gradient_estimation_strategy != "LR":
+                        loss = loss.mean()
+                        loss = loss * self.config.loss_coeff
+                        self.accelerator.backward(loss)
+                    else:
+                        loss = loss.detach()
+                        log_probs = torch.sum(samples["log_probs"], dim=1)
+                        loss_target = torch.mean(loss*log_probs) * self.config.loss_coeff
+                        self.accelerator.backward(loss_target)
+                        loss = loss.mean()
+
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.trainable_layers.parameters()
+                            if not isinstance(self.trainable_layers, list)
+                            else self.trainable_layers,
+                            self.config.train_max_grad_norm,
+                        )
+
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                    info["reward_mean"].append(rewards.mean())
+                    info["reward_std"].append(rewards.std())
+                    info["loss"].append(loss.item())
 
         # Checks if the accelerator has performed an optimization step behind the scenes
         if self.accelerator.sync_gradients:

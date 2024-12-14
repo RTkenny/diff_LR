@@ -130,7 +130,7 @@ def pipeline_step_with_grad(
             backprop_timestep = int(torch.randint(backprop_kwargs['min'], backprop_kwargs['max'], (1,)).item())
         elif backprop_strategy == 'fixed':
             backprop_timestep = int(backprop_kwargs['value'])
-        elif backprop_strategy == 'LR':
+        else:
             backprop_timestep = -2
             break
     
@@ -206,7 +206,8 @@ def pipeline_step_with_grad(
             latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, t)
 
             if backprop_timestep == -2:
-                latent_model_input = latent_model_input.detach()
+                # latent_model_input = latent_model_input.detach()
+                pass
 
             # predict the noise residual
             if gradient_checkpoint:

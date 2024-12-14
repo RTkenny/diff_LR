@@ -109,7 +109,7 @@ class RLR_Config:
     sample_guidance_scale: float = 5.0
     prompt_fn: str = 'simple_animals'
     gradient_estimation_strategy: str = 'gaussian'    # gaussian, uniform, fixed, LR, RL
-    backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 49}, 'LR':{None}}
+    backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 49}, 'LR':{None}, 'RL':{None}}
     
     train_batch_size: int = 1
     train_use_8bit_adam: bool = False
@@ -121,6 +121,12 @@ class RLR_Config:
     train_gradient_accumulation_steps: int = 1
     train_max_grad_norm: float = 1.0
     negative_prompts: Optional[str] = None
+    train_clip_range: float = 1e-4
+    train_adv_clip_max: float = 5
+    per_prompt_stat_tracking: bool = False
+    train_num_inner_epochs: int = 1
+    train_cfg: bool = True
+    timestep_fraction: float = 1.0
     
     push_to_hub: bool = False
 
