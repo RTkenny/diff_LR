@@ -101,6 +101,8 @@ class RLR_Config:
     allow_tf32: bool = True
     resume_from: str = ""
     sample_num_steps: int = 50
+    sample_num_batches_per_epoch: int = 4
+    sample_batch_size: int = 32
     reward_fn: str = 'hps'
     grad_scale: float = 1
     loss_coeff = 0.01

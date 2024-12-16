@@ -500,19 +500,23 @@ class RLR_Trainer(BaseTrainer):
                 if self.config.gradient_estimation_strategy == "RL":
                     with torch.no_grad():
                         samples, prompt_image_pairs = self._generate_samples(
-                            batch_size=self.config.train_batch_size,
+                            iterations = self.config.sample_num_batches_per_epoch,
+                            batch_size=self.config.sample_batch_size,
                         )
                     print("Samples generated")
                     samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
-                    prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
-                    rewards, rewards_metadata = self.compute_rewards(prompt_image_data)
+                    # prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
+                    rewards, rewards_metadata = self.compute_rewards(prompt_image_pairs)
 
-                    for i, image_data in enumerate(prompt_image_data):
+                    for i, image_data in enumerate(prompt_image_pairs):
                         image_data.extend([rewards[i], rewards_metadata[i]])
 
                     rewards = torch.cat(rewards)
                     rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
+
+                    info["reward_mean"].append(rewards.mean())
+                    info["reward_std"].append(rewards.std())
 
                     if self.config.per_prompt_stat_tracking:
                         # gather the prompts across processes
@@ -569,15 +573,21 @@ class RLR_Trainer(BaseTrainer):
 
                 else:
                     samples, prompt_image_pairs = self._generate_samples(
+                            iterrations = 1,
                             batch_size=self.config.train_batch_size,
                         )
+                    prompt_image_data = {}
+                    prompt_image_data["images"] = prompt_image_pairs[0][0]
+                    prompt_image_data["prompts"] = prompt_image_pairs[0][1]
+                    prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
+
                     print("Samples generated")
                     samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
                     if "hps" in self.config.reward_fn:
-                        loss, rewards = self.loss_fn(prompt_image_pairs["images"], prompt_image_pairs["prompts"])
+                        loss, rewards = self.loss_fn(prompt_image_data["images"], prompt_image_data["prompts"])
                     else:
-                        loss, rewards = self.loss_fn(prompt_image_pairs["images"])
+                        loss, rewards = self.loss_fn(prompt_image_data["images"])
 
                     rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
                     loss = loss.mean()
@@ -637,9 +647,18 @@ class RLR_Trainer(BaseTrainer):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.config.seed)
             _, prompt_image_pairs = self._generate_samples(
-                    batch_size=self.config.train_batch_size, with_grad=False, prompts=self.eval_prompts
+                    iterations = 1,
+                    batch_size=self.config.train_batch_size,
+                    with_grad=False, 
+                    prompts=self.eval_prompts
                 )
-            self.image_samples_callback(prompt_image_pairs, global_step, self.accelerator.trackers[0])
+            
+            prompt_image_data = {}
+            prompt_image_data["images"] = prompt_image_pairs[0][0]
+            prompt_image_data["prompts"] = prompt_image_pairs[0][1]
+            prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
+
+            self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
             seed = random.randint(0, 100)
             torch.manual_seed(seed)
             if torch.cuda.is_available():
@@ -675,7 +694,7 @@ class RLR_Trainer(BaseTrainer):
         self.sd_pipeline.load_checkpoint(models, input_dir)
         models.pop()  # ensures that accelerate doesn't try to handle loading of the model
 
-    def _generate_samples(self, batch_size, with_grad=True, prompts=None):
+    def _generate_samples(self, iterations, batch_size, with_grad=True, prompts=None):
         """
         Generate samples from the model
 
@@ -690,70 +709,70 @@ class RLR_Trainer(BaseTrainer):
         # samples = {}
 
         samples = []
-        # prompt_image_pairs = []
-        prompt_image_pairs = {}
+        prompt_image_pairs = []
+        # prompt_image_pairs = {}
 
         sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
 
-        if prompts is None:
-            prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
-        else:
-            prompt_metadata = [{} for _ in range(batch_size)]
+        for _ in range(iterations):
+            if prompts is None or iterations != 1:
+                prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
+            else:
+                prompt_metadata = [{} for _ in range(batch_size)]
 
-        prompt_ids = self.sd_pipeline.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.sd_pipeline.tokenizer.model_max_length,
-        ).input_ids.to(self.accelerator.device)
+            prompt_ids = self.sd_pipeline.tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="max_length",
+                truncation=True,
+                max_length=self.sd_pipeline.tokenizer.model_max_length,
+            ).input_ids.to(self.accelerator.device)
+            prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
 
-        prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
+            if with_grad:
+                sd_output = self.sd_pipeline.rgb_with_grad(
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    num_inference_steps=self.config.sample_num_steps,
+                    guidance_scale=self.config.sample_guidance_scale,
+                    eta=self.config.sample_eta,
+                    backprop_strategy=self.config.gradient_estimation_strategy,
+                    backprop_kwargs=self.config.backprop_kwargs[self.config.gradient_estimation_strategy],
+                    output_type="pt",
+                )
+            else:
+                sd_output = self.sd_pipeline(
+                    prompt_embeds=prompt_embeds,
+                    negative_prompt_embeds=sample_neg_prompt_embeds,
+                    num_inference_steps=self.config.sample_num_steps,
+                    guidance_scale=self.config.sample_guidance_scale,
+                    eta=self.config.sample_eta,
+                    output_type="pt",
+                )
 
-        if with_grad:
-            sd_output = self.sd_pipeline.rgb_with_grad(
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=sample_neg_prompt_embeds,
-                num_inference_steps=self.config.sample_num_steps,
-                guidance_scale=self.config.sample_guidance_scale,
-                eta=self.config.sample_eta,
-                backprop_strategy=self.config.gradient_estimation_strategy,
-                backprop_kwargs=self.config.backprop_kwargs[self.config.gradient_estimation_strategy],
-                output_type="pt",
+            images = sd_output.images
+            latents = sd_output.latents
+            log_probs = sd_output.log_probs
+
+            latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
+            log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
+            timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
+
+            samples.append(
+                {
+                    "prompt_ids": prompt_ids,
+                    "prompt_embeds": prompt_embeds,
+                    "timesteps": timesteps,
+                    "latents": latents[:, :-1],  # each entry is the latent before timestep t
+                    "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
+                    "log_probs": log_probs,
+                    "negative_prompt_embeds": sample_neg_prompt_embeds,
+                }
             )
-        else:
-            sd_output = self.sd_pipeline(
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=sample_neg_prompt_embeds,
-                num_inference_steps=self.config.sample_num_steps,
-                guidance_scale=self.config.sample_guidance_scale,
-                eta=self.config.sample_eta,
-                output_type="pt",
-            )
-
-        images = sd_output.images
-        latents = sd_output.latents
-        log_probs = sd_output.log_probs
-
-        latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
-        log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-        timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
-
-        samples.append(
-            {
-                "prompt_ids": prompt_ids,
-                "prompt_embeds": prompt_embeds,
-                "timesteps": timesteps,
-                "latents": latents[:, :-1],  # each entry is the latent before timestep t
-                "next_latents": latents[:, 1:],  # each entry is the latent after timestep t
-                "log_probs": log_probs,
-                "negative_prompt_embeds": sample_neg_prompt_embeds,
-            }
-        )
-        # prompt_image_pairs.append([images, prompts, prompt_metadata])
-        prompt_image_pairs["images"] = images
-        prompt_image_pairs["prompts"] = prompts
-        prompt_image_pairs["prompt_metadata"] = prompt_metadata
+            prompt_image_pairs.append([images, prompts, prompt_metadata])
+            # prompt_image_pairs["images"] = images
+            # prompt_image_pairs["prompts"] = prompts
+            # prompt_image_pairs["prompt_metadata"] = prompt_metadata
 
         return samples, prompt_image_pairs
 
