@@ -87,7 +87,7 @@ class AestheticScorer(torch.nn.Module):
 
     def __init__(self, *, dtype, model_id, model_filename):
         super().__init__()
-        self.clip = CLIPModel.from_pretrained("/home/rt/data/SD_playground/openai/clip-vit-large-patch14")
+        self.clip = CLIPModel.from_pretrained("/home/rt/data/SD_playground/openai/clip-vit-large-patch14") #/root/autodl-tmp/openai/clip-vit-large-patch14
         self.processor = CLIPProcessor.from_pretrained("/home/rt/data/SD_playground/openai/clip-vit-large-patch14")
         self.mlp = MLP()
         state_dict = torch.load(ASSETS_PATH.joinpath("sac+logos+ava1-l14-linearMSE.pth"))

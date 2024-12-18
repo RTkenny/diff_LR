@@ -5,5 +5,7 @@ CUDA_VISIBLE_DEVICES=3 accelerate launch train_with_trl.py \
     --sample_batch_size=8 \
     --train_batch_size=4 \
     --train_gradient_accumulation_steps=2 \
+    --project_dir="./save"\
+    --logging_dir="./logs"\
     --tracker_project_name="stable_diffusion_training" \
     --log_with="wandb"
