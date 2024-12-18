@@ -9,10 +9,12 @@ import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from aesthetic_scorer import AestheticScorerDiff
-
+import tempfile
+from PIL import Image
 from accelerate.utils import ProjectConfiguration, set_seed
 from transformers import is_wandb_available
 import hpsv2
+import numpy as np
 from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
 import torchvision
 from sd_pipeline import DiffusionPipeline
@@ -189,6 +191,8 @@ class RLR_Trainer(BaseTrainer):
 
                 accelerator_project_config.iteration = checkpoint_numbers[-1] + 1
 
+        self.num_train_timesteps = int(self.config.sample_num_steps * self.config.timestep_fraction)
+
         self.accelerator = Accelerator(
             log_with=self.config.log_with,
             mixed_precision=self.config.mixed_precision,
@@ -196,7 +200,7 @@ class RLR_Trainer(BaseTrainer):
             # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
-            gradient_accumulation_steps=self.config.train_gradient_accumulation_steps,
+            gradient_accumulation_steps=self.config.train_gradient_accumulation_steps * self.num_train_timesteps,
             **self.config.accelerator_kwargs,
         )
 
@@ -436,7 +440,6 @@ class RLR_Trainer(BaseTrainer):
             else:
                 embeds = sample["prompt_embeds"]
 
-            self.num_train_timesteps = int(self.config.sample_num_steps * self.config.timestep_fraction)
             for j in range(self.num_train_timesteps):
                 with self.accelerator.accumulate(self.sd_pipeline.unet):
                     loss, approx_kl, clipfrac = self.calculate_loss(
@@ -496,25 +499,147 @@ class RLR_Trainer(BaseTrainer):
         self.sd_pipeline.unet.train()
         
         if self.config.gradient_estimation_strategy == "RL":
-            with torch.no_grad():
-                samples, prompt_image_pairs = self._generate_samples(
-                    iterations = self.config.sample_num_batches_per_epoch,
-                    batch_size=self.config.sample_batch_size,
-                )
-            print("Samples generated")
+
+            ## version 1 ##
+            # with torch.no_grad():
+            #     samples, prompt_image_pairs = self._generate_samples(
+            #         iterations = self.config.sample_num_batches_per_epoch,
+            #         batch_size=self.config.sample_batch_size,
+            #     )
+            # print("Samples generated")
+            # samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+
+            # # prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
+            # rewards, rewards_metadata = self.compute_rewards(prompt_image_pairs)
+
+            # for i, image_data in enumerate(prompt_image_pairs):
+            #     image_data.extend([rewards[i], rewards_metadata[i]])
+
+            # rewards = torch.cat(rewards)
+            # rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
+
+            # # info["reward_mean"].append(rewards.mean())
+            # # info["reward_std"].append(rewards.std())
+
+            # self.accelerator.log(
+            #     {
+            #         "reward": rewards,
+            #         "epoch": epoch,
+            #         "reward_mean": rewards.mean(),
+            #         "reward_std": rewards.std(),
+            #     },
+            #     step=global_step,
+            # )
+
+            # if self.config.per_prompt_stat_tracking:
+            #     # gather the prompts across processes
+            #     prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
+            #     prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
+            #     advantages = self.stat_tracker.update(prompts, rewards)
+            # else:
+            #     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+            # # ungather advantages;  keep the entries corresponding to the samples on this process
+            # samples["advantages"] = (
+            #     torch.as_tensor(advantages)
+            #     .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
+            #     .to(self.accelerator.device)
+            # )
+
+            # total_batch_size, num_timesteps = samples["timesteps"].shape
+
+            # for inner_epoch in range(self.config.train_num_inner_epochs):
+            #     # shuffle samples along batch dimension
+            #     perm = torch.randperm(total_batch_size, device=self.accelerator.device)
+            #     samples = {k: v[perm] for k, v in samples.items()}
+
+            #     # shuffle along time dimension independently for each sample
+            #     # still trying to understand the code below
+            #     perms = torch.stack(
+            #         [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
+            #     )
+
+            #     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
+            #         samples[key] = samples[key][
+            #             torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
+            #             perms,
+            #         ]
+
+            #     original_keys = samples.keys()
+            #     original_values = samples.values()
+            #     # rebatch them as user defined train_batch_size is different from sample_batch_size
+            #     reshaped_values = [v.reshape(-1, self.config.train_batch_size, *v.shape[1:]) for v in original_values]
+
+            #     # Transpose the list of original values
+            #     transposed_values = zip(*reshaped_values)
+            #     # Create new dictionaries for each row of transposed values
+            #     samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
+
+            #     # self.sd_pipeline.unet.train()
+            #     global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
+            #     # ensure optimization step at the end of the inner epoch
+            #     if not self.accelerator.sync_gradients:
+            #         raise ValueError(
+            #             "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
+            #         )
+                
+
+            ## version 2 from trl ##
+            samples, prompt_image_data = self._generate_samples(
+                iterations=self.config.sample_num_batches_per_epoch,
+                batch_size=self.config.sample_batch_size,
+                with_grad=False
+            )
+
+            # collate samples into dict where each entry has shape (num_batches_per_epoch * sample.batch_size, ...)
             samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
+            rewards, rewards_metadata = self.compute_rewards(
+                prompt_image_data, is_async=self.config.async_reward_computation
+            )
 
-            # prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
-            rewards, rewards_metadata = self.compute_rewards(prompt_image_pairs)
-
-            for i, image_data in enumerate(prompt_image_pairs):
+            for i, image_data in enumerate(prompt_image_data):
                 image_data.extend([rewards[i], rewards_metadata[i]])
 
-            rewards = torch.cat(rewards)
-            rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
+            # if self.image_samples_callback is not None and self.accelerator.is_main_process: # add "and self.accelerator.is_main_process"
+            #     self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
 
-            info["reward_mean"].append(rewards.mean())
-            info["reward_std"].append(rewards.std())
+            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
+            with tempfile.TemporaryDirectory() as tmpdir:
+                images = prompt_image_data[0][0]
+                prompts = prompt_image_data[0][1]
+                for i, image in enumerate(images):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                self.accelerator.log(
+                    {
+                        "images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}.jpg"),
+                                caption=f"{prompt:.25}",
+                            )
+                            for i, prompt in enumerate(
+                                prompts
+                            )  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
+
+            rewards = torch.cat(rewards)
+            rewards = self.accelerator.gather(rewards).cpu().numpy()
+
+            self.accelerator.log(
+                {
+                    "reward": rewards,
+                    "epoch": epoch,
+                    "reward_mean": rewards.mean(),
+                    "reward_std": rewards.std(),
+                },
+                step=global_step,
+            )
 
             if self.config.per_prompt_stat_tracking:
                 # gather the prompts across processes
@@ -530,6 +655,8 @@ class RLR_Trainer(BaseTrainer):
                 .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
                 .to(self.accelerator.device)
             )
+
+            del samples["prompt_ids"]
 
             total_batch_size, num_timesteps = samples["timesteps"].shape
 
@@ -560,14 +687,14 @@ class RLR_Trainer(BaseTrainer):
                 # Create new dictionaries for each row of transposed values
                 samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
 
-                # self.sd_pipeline.unet.train()
+                self.sd_pipeline.unet.train()
                 global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
                 # ensure optimization step at the end of the inner epoch
                 if not self.accelerator.sync_gradients:
                     raise ValueError(
                         "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
                     )
-
+                
         else:
             for _ in range(self.config.train_gradient_accumulation_steps):
                 with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
@@ -619,42 +746,42 @@ class RLR_Trainer(BaseTrainer):
                     info["reward_std"].append(rewards.std())
                     info["loss"].append(loss.item())
 
-        # Checks if the accelerator has performed an optimization step behind the scenes
-        if self.accelerator.sync_gradients:
-            # log training-related stuff
-            info = {k: torch.mean(torch.tensor(v)) for k, v in info.items()}
-            info.update({"epoch": epoch})
-            self.accelerator.log(info, step=global_step)
-            global_step += 1
-            info = defaultdict(list)
-        else:
-            raise ValueError(
-                "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
-            )
-        # Logs generated images
-        if self.image_samples_callback is not None and global_step % self.config.log_image_freq == 0 and self.accelerator.is_main_process:
-            print("Logging images")
-            # Fix the random seed for reproducibility
-            torch.manual_seed(self.config.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.config.seed)
-            _, prompt_image_pairs = self._generate_samples(
-                    iterations = 1,
-                    batch_size=self.config.train_batch_size,
-                    with_grad=False, 
-                    prompts=self.eval_prompts
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if self.accelerator.sync_gradients:
+                # log training-related stuff
+                info = {k: torch.mean(torch.tensor(v)) for k, v in info.items()}
+                info.update({"epoch": epoch})
+                self.accelerator.log(info, step=global_step)
+                global_step += 1
+                info = defaultdict(list)
+            else:
+                raise ValueError(
+                    "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
                 )
-            
-            prompt_image_data = {}
-            prompt_image_data["images"] = prompt_image_pairs[0][0]
-            prompt_image_data["prompts"] = prompt_image_pairs[0][1]
-            prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
+            # Logs generated images
+            if self.image_samples_callback is not None and global_step % self.config.log_image_freq == 0 and self.accelerator.is_main_process:
+                print("Logging images")
+                # Fix the random seed for reproducibility
+                torch.manual_seed(self.config.seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.config.seed)
+                _, prompt_image_pairs = self._generate_samples(
+                        iterations = 1,
+                        batch_size=self.config.train_batch_size,
+                        with_grad=False, 
+                        prompts=self.eval_prompts
+                    )
+                
+                prompt_image_data = {}
+                prompt_image_data["images"] = prompt_image_pairs[0][0]
+                prompt_image_data["prompts"] = prompt_image_pairs[0][1]
+                prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
 
-            self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
-            seed = random.randint(0, 100)
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)            
+                self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
+                seed = random.randint(0, 100)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)            
 
         if epoch != 0 and epoch % self.config.save_freq == 0:
             print("Saving checkpoint")

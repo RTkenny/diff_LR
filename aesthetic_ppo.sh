@@ -1,12 +1,12 @@
-CUDA_VISIBLE_DEVICES=0 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=1 accelerate launch main.py \
     --num_epochs=200 \
-    --train_gradient_accumulation_steps=1 \
     --gradient_estimation_strategy='RL' \
     --sample_num_steps=50 \
     --sample_num_batches_per_epoch=4 \
     --sample_batch_size=8 \
+    --train_batch_size=4 \
+    --train_gradient_accumulation_steps=2 \
     --reward_fn='aesthetic' \
     --prompt_fn='simple_animals' \
-    --train_batch_size=8 \
     --tracker_project_name="stable_diffusion_training" \
     --log_with="wandb"

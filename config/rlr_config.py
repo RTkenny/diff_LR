@@ -104,6 +104,7 @@ class RLR_Config:
     sample_num_batches_per_epoch: int = 4
     sample_batch_size: int = 32
     reward_fn: str = 'hps'
+    async_reward_computation: bool = False
     grad_scale: float = 1
     loss_coeff = 0.01
     aesthetic_target: float = 10
