@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=3 accelerate launch train_with_trl.py \
+CUDA_VISIBLE_DEVICES=2 accelerate launch train_with_trl.py \
     --num_epochs=200 \
     --sample_num_steps=50 \
     --sample_num_batches_per_epoch=4 \

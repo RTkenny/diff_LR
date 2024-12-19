@@ -7,13 +7,16 @@ builtins.st = ipdb.set_trace
 from dataclasses import dataclass, field
 import prompts as prompts_file
 import numpy as np
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, is_wandb_available
 
 from config.rlr_config import RLR_Config
 from rlr_trainer import RLR_Trainer
 from sd_pipeline import DiffusionPipeline
 from trl.models.auxiliary_modules import aesthetic_scorer
-
+import tempfile
+from PIL import Image
+if is_wandb_available():
+    import wandb
 
 @dataclass
 class ScriptArguments:
@@ -26,18 +29,31 @@ class ScriptArguments:
 
 
 
-def image_outputs_logger(image_pair_data, global_step, accelerate_logger):
-    # For the sake of this example, we will only log the last batch of images
-    # and associated data
-    result = {}
-    images, prompts = [image_pair_data["images"], image_pair_data["prompts"]]
-    for i, image in enumerate(images[:4]):
-        prompt = prompts[i]
-        result[f"{prompt}"] = image.unsqueeze(0).float()
-    accelerate_logger.log_images(
-        result,
-        step=global_step,
-    )
+def image_outputs_logger(image_data, global_step, accelerate_logger):
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+                images = image_data[0][0]
+                prompts = image_data[0][1]
+                for i, image in enumerate(images):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                accelerate_logger.log(
+                    {
+                        "images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}.jpg"),
+                                caption=f"{prompt:.25}",
+                            )
+                            for i, prompt in enumerate(
+                                prompts
+                            )  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
 
 
 if __name__ == "__main__":

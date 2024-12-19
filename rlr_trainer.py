@@ -600,37 +600,14 @@ class RLR_Trainer(BaseTrainer):
             for i, image_data in enumerate(prompt_image_data):
                 image_data.extend([rewards[i], rewards_metadata[i]])
 
-            # if self.image_samples_callback is not None and self.accelerator.is_main_process: # add "and self.accelerator.is_main_process"
-            #     self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
-
-            # this is a hack to force wandb to log the images as JPEGs instead of PNGs
-            with tempfile.TemporaryDirectory() as tmpdir:
-                images = prompt_image_data[0][0]
-                prompts = prompt_image_data[0][1]
-                for i, image in enumerate(images):
-                    pil = Image.fromarray(
-                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
-                    )
-                    pil = pil.resize((256, 256))
-                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
-                self.accelerator.log(
-                    {
-                        "images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{i}.jpg"),
-                                caption=f"{prompt:.25}",
-                            )
-                            for i, prompt in enumerate(
-                                prompts
-                            )  # only log rewards from process 0
-                        ],
-                    },
-                    step=global_step,
-                )
+            if self.image_samples_callback is not None and self.accelerator.is_main_process: # add "and self.accelerator.is_main_process"
+                self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
 
             rewards = torch.cat(rewards)
             rewards = self.accelerator.gather(rewards).cpu().numpy()
 
+            print(f'rewards :{rewards}')
+            print(type(rewards))
             self.accelerator.log(
                 {
                     "reward": rewards,

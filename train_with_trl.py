@@ -31,11 +31,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
+import tempfile
+from PIL import Image
 import torch.nn as nn
 from importlib import resources
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import EntryNotFoundError
 from transformers import CLIPModel, CLIPProcessor, HfArgumentParser, is_torch_npu_available, is_torch_xpu_available
+from transformers import is_wandb_available
+if is_wandb_available():
+    import wandb
 
 from trl import DDPOConfig, DDPOTrainer, DefaultDDPOStableDiffusionPipeline
 ASSETS_PATH = resources.files("assets")
@@ -164,20 +169,46 @@ def prompt_fn():
 
 
 def image_outputs_logger(image_data, global_step, accelerate_logger):
-    # For the sake of this example, we will only log the last batch of images
-    # and associated data
-    result = {}
-    images, prompts, _, rewards, _ = image_data[-1]
+    # # version 1
+    # # For the sake of this example, we will only log the last batch of images
+    # # and associated data
+    # result = {}
+    # images, prompts, _, rewards, _ = image_data[-1]
 
-    for i, image in enumerate(images):
-        prompt = prompts[i]
-        reward = rewards[i].item()
-        result[f"{prompt:.25} | {reward:.2f}"] = image.unsqueeze(0).float()
+    # for i, image in enumerate(images):
+    #     prompt = prompts[i]
+    #     reward = rewards[i].item()
+    #     result[f"{prompt:.25} | {reward:.2f}"] = image.unsqueeze(0).float()
 
-    accelerate_logger.log_images(
-        result,
-        step=global_step,
-    )
+    # accelerate_logger.log_images(
+    #     result,
+    #     step=global_step,
+    # )
+
+    # version 2
+    with tempfile.TemporaryDirectory() as tmpdir:
+                images = image_data[0][0]
+                prompts = image_data[0][1]
+                for i, image in enumerate(images):
+                    pil = Image.fromarray(
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                    )
+                    pil = pil.resize((256, 256))
+                    pil.save(os.path.join(tmpdir, f"{i}.jpg"))
+                accelerate_logger.log(
+                    {
+                        "images": [
+                            wandb.Image(
+                                os.path.join(tmpdir, f"{i}.jpg"),
+                                caption=f"{prompt:.25}",
+                            )
+                            for i, prompt in enumerate(
+                                prompts
+                            )  # only log rewards from process 0
+                        ],
+                    },
+                    step=global_step,
+                )
 
 
 if __name__ == "__main__":
