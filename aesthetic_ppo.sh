@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=1 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
     --num_epochs=200 \
     --gradient_estimation_strategy='RL' \
     --sample_num_steps=50 \

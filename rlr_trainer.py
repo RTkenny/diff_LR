@@ -192,7 +192,17 @@ class RLR_Trainer(BaseTrainer):
                 accelerator_project_config.iteration = checkpoint_numbers[-1] + 1
 
         self.num_train_timesteps = int(self.config.sample_num_steps * self.config.timestep_fraction)
+        self.num_train_timesteps = self.num_train_timesteps // self.config.chain_len + self.num_train_timesteps % self.config.chain_len
+        
+        if self.config.gradient_estimation_strategy == "RL":
+            gradient_accumulation_steps = self.config.train_gradient_accumulation_steps * self.num_train_timesteps
+        
+        elif self.config.gradient_estimation_strategy == "ZO":
+            gradient_accumulation_steps = self.config.train_zo_sample_budget
 
+        else:
+            gradient_accumulation_steps = self.config.train_gradient_accumulation_steps
+        
         self.accelerator = Accelerator(
             log_with=self.config.log_with,
             mixed_precision=self.config.mixed_precision,
@@ -200,7 +210,7 @@ class RLR_Trainer(BaseTrainer):
             # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
             # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
             # the total number of optimizer steps to accumulate across.
-            gradient_accumulation_steps=self.config.train_gradient_accumulation_steps * self.num_train_timesteps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             **self.config.accelerator_kwargs,
         )
 
@@ -333,6 +343,66 @@ class RLR_Trainer(BaseTrainer):
             )
         return zip(*rewards)
     
+    def perturb_all_params(self, random_seed=None, scaling_factor=1):
+        """
+        Perturb the all parameters with random vector z.
+        Input: 
+        - random_seed: random seed for in-place perturbation (if it's None, we will use self.zo_random_seed)
+        - scaling_factor: theta = theta + scaling_factor * z * eps
+        """
+
+        # Set the random seed to ensure that we sample the same z for perturbation/update
+        torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+        
+        for name, param in self.named_parameters_to_optim:
+            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            param.data = param.data + scaling_factor * z * self.zo_eps
+
+    def zo_forward(self, model, data, target, retain_graph=False):
+        """
+        Get (no gradient) loss from the model. Dropout is turned off too.
+        """
+        model.eval()
+        if not retain_graph:
+            with torch.inference_mode():
+                loss, output = self.compute_loss(model, data, target)
+        else:
+            loss, output = self.compute_loss(model, data, target)
+        return loss.detach(), output
+
+    def zo_step_all_params(self, model, data, target, sample_budget=1):
+        """
+        Estimate gradient by MeZO. Return the loss from f(theta + z)
+        """
+
+        # What parameters to optimize 
+        self.named_parameters_to_optim = []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.named_parameters_to_optim.append((name, param))
+
+        for _ in range(sample_budget):
+            # Sample the random seed for sampling z
+            self.zo_random_seed = np.random.randint(1000000000)
+
+            # First function evaluation
+            self.perturb_all_params(scaling_factor=1)
+            loss1, _ = self.zo_forward(model, data, target)
+
+            # Second function evaluation
+            self.perturb_all_params(scaling_factor=-2)
+            loss2, _ = self.zo_forward(model, data, target)
+
+            self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
+            self.projected_grad = self.projected_grad / float(sample_budget)
+
+            # Reset model back to its parameters at start of step
+            self.perturb_all_params(scaling_factor=1)
+            self.zo_backward()
+
+        loss, output = self.zo_forward(model, data, target)
+        return loss, output
+
     def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
         """
         Calculate the loss for a batch of an unpacked sample
@@ -356,34 +426,42 @@ class RLR_Trainer(BaseTrainer):
             loss (torch.Tensor), approx_kl (torch.Tensor), clipfrac (torch.Tensor)
             (all of these are of shape (1,))
         """
-        with self.autocast():
-            if self.config.train_cfg:
-                noise_pred = self.sd_pipeline.unet(
-                    torch.cat([latents] * 2),
-                    torch.cat([timesteps] * 2),
-                    embeds,
-                ).sample
-                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
-                )
-            else:
-                noise_pred = self.sd_pipeline.unet(
-                    latents,
+        temp_latents = None
+        temp_eta = 0.0
+        for i in range(self.config.chain_len):
+            if i == self.config.chain_len - 1 or timesteps[0].cpu().numpy() == 0:
+                temp_eta = self.config.sample_eta
+                temp_latents = next_latents
+
+            with self.autocast():
+                if self.config.train_cfg:
+                    noise_pred = self.sd_pipeline.unet(
+                        torch.cat([latents] * 2),
+                        torch.cat([timesteps] * 2),
+                        embeds,
+                    ).sample # .sample is equal to [0] ？
+                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + self.config.sample_guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
+                    )
+                else:
+                    noise_pred = self.sd_pipeline.unet(
+                        latents,
+                        timesteps,
+                        embeds,
+                    ).sample
+                # compute the log prob of next_latents given latents under the current model
+
+                scheduler_step_output = self.sd_pipeline.scheduler_step(
+                    noise_pred,
                     timesteps,
-                    embeds,
-                ).sample
-            # compute the log prob of next_latents given latents under the current model
+                    latents,
+                    eta=temp_eta,
+                    prev_sample=temp_latents,
+                )
 
-            scheduler_step_output = self.sd_pipeline.scheduler_step(
-                noise_pred,
-                timesteps,
-                latents,
-                eta=self.config.sample_eta,
-                prev_sample=next_latents,
-            )
-
-            log_prob = scheduler_step_output.log_probs
+                timesteps -= 1
+                log_prob = scheduler_step_output.log_probs
 
         advantages = torch.clamp(
             advantages,
@@ -462,7 +540,7 @@ class RLR_Trainer(BaseTrainer):
                             else self.trainable_layers,
                             self.config.train_max_grad_norm,
                         )
-                    # print(f'{j}_times')
+            
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
@@ -498,92 +576,7 @@ class RLR_Trainer(BaseTrainer):
 
         self.sd_pipeline.unet.train()
         
-        if self.config.gradient_estimation_strategy == "RL":
-
-            ## version 1 ##
-            # with torch.no_grad():
-            #     samples, prompt_image_pairs = self._generate_samples(
-            #         iterations = self.config.sample_num_batches_per_epoch,
-            #         batch_size=self.config.sample_batch_size,
-            #     )
-            # print("Samples generated")
-            # samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
-
-            # # prompt_image_data = [[prompt_image_pairs["images"], prompt_image_pairs["prompts"], prompt_image_pairs["prompt_metadata"]]]
-            # rewards, rewards_metadata = self.compute_rewards(prompt_image_pairs)
-
-            # for i, image_data in enumerate(prompt_image_pairs):
-            #     image_data.extend([rewards[i], rewards_metadata[i]])
-
-            # rewards = torch.cat(rewards)
-            # rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
-
-            # # info["reward_mean"].append(rewards.mean())
-            # # info["reward_std"].append(rewards.std())
-
-            # self.accelerator.log(
-            #     {
-            #         "reward": rewards,
-            #         "epoch": epoch,
-            #         "reward_mean": rewards.mean(),
-            #         "reward_std": rewards.std(),
-            #     },
-            #     step=global_step,
-            # )
-
-            # if self.config.per_prompt_stat_tracking:
-            #     # gather the prompts across processes
-            #     prompt_ids = self.accelerator.gather(samples["prompt_ids"]).cpu().numpy()
-            #     prompts = self.sd_pipeline.tokenizer.batch_decode(prompt_ids, skip_special_tokens=True)
-            #     advantages = self.stat_tracker.update(prompts, rewards)
-            # else:
-            #     advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-
-            # # ungather advantages;  keep the entries corresponding to the samples on this process
-            # samples["advantages"] = (
-            #     torch.as_tensor(advantages)
-            #     .reshape(self.accelerator.num_processes, -1)[self.accelerator.process_index]
-            #     .to(self.accelerator.device)
-            # )
-
-            # total_batch_size, num_timesteps = samples["timesteps"].shape
-
-            # for inner_epoch in range(self.config.train_num_inner_epochs):
-            #     # shuffle samples along batch dimension
-            #     perm = torch.randperm(total_batch_size, device=self.accelerator.device)
-            #     samples = {k: v[perm] for k, v in samples.items()}
-
-            #     # shuffle along time dimension independently for each sample
-            #     # still trying to understand the code below
-            #     perms = torch.stack(
-            #         [torch.randperm(num_timesteps, device=self.accelerator.device) for _ in range(total_batch_size)]
-            #     )
-
-            #     for key in ["timesteps", "latents", "next_latents", "log_probs"]:
-            #         samples[key] = samples[key][
-            #             torch.arange(total_batch_size, device=self.accelerator.device)[:, None],
-            #             perms,
-            #         ]
-
-            #     original_keys = samples.keys()
-            #     original_values = samples.values()
-            #     # rebatch them as user defined train_batch_size is different from sample_batch_size
-            #     reshaped_values = [v.reshape(-1, self.config.train_batch_size, *v.shape[1:]) for v in original_values]
-
-            #     # Transpose the list of original values
-            #     transposed_values = zip(*reshaped_values)
-            #     # Create new dictionaries for each row of transposed values
-            #     samples_batched = [dict(zip(original_keys, row_values)) for row_values in transposed_values]
-
-            #     # self.sd_pipeline.unet.train()
-            #     global_step = self._train_batched_samples(inner_epoch, epoch, global_step, samples_batched)
-            #     # ensure optimization step at the end of the inner epoch
-            #     if not self.accelerator.sync_gradients:
-            #         raise ValueError(
-            #             "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
-            #         )
-                
-
+        if self.config.gradient_estimation_strategy == "RL":  
             ## version 2 from trl ##
             samples, prompt_image_data = self._generate_samples(
                 iterations=self.config.sample_num_batches_per_epoch,
@@ -606,8 +599,6 @@ class RLR_Trainer(BaseTrainer):
             rewards = torch.cat(rewards)
             rewards = self.accelerator.gather(rewards).cpu().numpy()
 
-            print(f'rewards :{rewards}')
-            print(type(rewards))
             self.accelerator.log(
                 {
                     "reward": rewards,
@@ -636,6 +627,8 @@ class RLR_Trainer(BaseTrainer):
             del samples["prompt_ids"]
 
             total_batch_size, num_timesteps = samples["timesteps"].shape
+            print(f'batch size:{total_batch_size}')
+            print(f'timesteps:{num_timesteps}')
 
             for inner_epoch in range(self.config.train_num_inner_epochs):
                 # shuffle samples along batch dimension
@@ -671,7 +664,35 @@ class RLR_Trainer(BaseTrainer):
                     raise ValueError(
                         "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
                     )
-                
+        
+        elif self.config.gradient_estimation_strategy == "ZO":
+            self.named_parameters_to_optim = []
+            for name, param in self.sd_pipeline.unet.named_parameters():
+                if param.requires_grad:
+                    self.named_parameters_to_optim.append((name, param))
+            
+            prompts, prompt_metadata = self._collect_data(self.config.train_batch_size)
+            for _ in range(self.config.train_zo_sample_budget):
+                with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(): # torch.no_grad or torch.enable_grad
+                    # Sample the random seed for sampling z
+                    self.zo_random_seed = np.random.randint(1000000000)
+
+                    # First function evaluation
+                    self.perturb_all_params(scaling_factor=1)
+                    loss1, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+
+                    # Second function evaluation
+                    self.perturb_all_params(scaling_factor=-2)
+                    loss2, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+
+                    self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
+                    self.projected_grad = self.projected_grad / float(self.config.train_zo_sample_budget)
+
+                    # Reset model back to its parameters at start of step
+                    self.perturb_all_params(scaling_factor=1)
+                    self.zo_backward()
+
+
         else:
             for _ in range(self.config.train_gradient_accumulation_steps):
                 with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
@@ -701,7 +722,7 @@ class RLR_Trainer(BaseTrainer):
                         loss = loss * self.config.loss_coeff
                         self.accelerator.backward(loss)
                     else:
-                        # problems
+                        # have problems, originally i want to implement in the policy gradient style 
                         loss = loss.detach()
                         log_probs = torch.sum(samples["log_probs"], dim=1)
                         loss_target = torch.mean(loss*log_probs) * self.config.loss_coeff
@@ -790,6 +811,60 @@ class RLR_Trainer(BaseTrainer):
         self.sd_pipeline.load_checkpoint(models, input_dir)
         models.pop()  # ensures that accelerate doesn't try to handle loading of the model
 
+    def _collect_data(self, batch_size):
+        return zip(*[self.prompt_fn() for _ in range(batch_size)])
+
+    def _inference_steps(self, prompts, sample_neg_prompt_embeds, with_grad=True):
+        """
+            given a prompt, generate samples from the model
+        """
+        prompt_ids = self.sd_pipeline.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=self.sd_pipeline.tokenizer.model_max_length,
+        ).input_ids.to(self.accelerator.device)
+        prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
+
+        if with_grad:
+            sd_output = self.sd_pipeline.rgb_with_grad(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=sample_neg_prompt_embeds,
+                num_inference_steps=self.config.sample_num_steps,
+                chain_len=self.config.chain_len,
+                guidance_scale=self.config.sample_guidance_scale,
+                eta=self.config.sample_eta,
+                backprop_strategy=self.config.gradient_estimation_strategy,
+                backprop_kwargs=self.config.backprop_kwargs[self.config.gradient_estimation_strategy],
+                output_type="pt",
+            )
+        else:
+            # ## version 1
+            # sd_output = self.sd_pipeline(
+            #     prompt_embeds=prompt_embeds,
+            #     negative_prompt_embeds=sample_neg_prompt_embeds,
+            #     num_inference_steps=self.config.sample_num_steps,
+            #     guidance_scale=self.config.sample_guidance_scale,
+            #     eta=self.config.sample_eta,
+            #     output_type="pt",
+            # )
+            ## version 2
+            with torch.no_grad():
+                sd_output = self.sd_pipeline.rgb_with_grad(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=sample_neg_prompt_embeds,
+                num_inference_steps=self.config.sample_num_steps,
+                chain_len=self.config.chain_len,
+                guidance_scale=self.config.sample_guidance_scale,
+                eta=self.config.sample_eta,
+                backprop_strategy=self.config.gradient_estimation_strategy,
+                backprop_kwargs=self.config.backprop_kwargs[self.config.gradient_estimation_strategy],
+                output_type="pt",
+            )
+                
+        return sd_output, prompt_ids, prompt_embeds
+
     def _generate_samples(self, iterations, batch_size, with_grad=True, prompts=None):
         """
         Generate samples from the model
@@ -812,39 +887,11 @@ class RLR_Trainer(BaseTrainer):
 
         for _ in range(iterations):
             if prompts is None or iterations != 1:
-                prompts, prompt_metadata = zip(*[self.prompt_fn() for _ in range(batch_size)])
+                prompts, prompt_metadata = self._collect_data(batch_size)
             else:
                 prompt_metadata = [{} for _ in range(batch_size)]
 
-            prompt_ids = self.sd_pipeline.tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=self.sd_pipeline.tokenizer.model_max_length,
-            ).input_ids.to(self.accelerator.device)
-            prompt_embeds = self.sd_pipeline.text_encoder(prompt_ids)[0]
-
-            if with_grad:
-                sd_output = self.sd_pipeline.rgb_with_grad(
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=sample_neg_prompt_embeds,
-                    num_inference_steps=self.config.sample_num_steps,
-                    guidance_scale=self.config.sample_guidance_scale,
-                    eta=self.config.sample_eta,
-                    backprop_strategy=self.config.gradient_estimation_strategy,
-                    backprop_kwargs=self.config.backprop_kwargs[self.config.gradient_estimation_strategy],
-                    output_type="pt",
-                )
-            else:
-                sd_output = self.sd_pipeline(
-                    prompt_embeds=prompt_embeds,
-                    negative_prompt_embeds=sample_neg_prompt_embeds,
-                    num_inference_steps=self.config.sample_num_steps,
-                    guidance_scale=self.config.sample_guidance_scale,
-                    eta=self.config.sample_eta,
-                    output_type="pt",
-                )
+            sd_output, prompt_ids, prompt_embeds = self._inference_steps(prompts, sample_neg_prompt_embeds, with_grad)
 
             images = sd_output.images
             latents = sd_output.latents
@@ -852,8 +899,11 @@ class RLR_Trainer(BaseTrainer):
 
             latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, ...)
             log_probs = torch.stack(log_probs, dim=1)  # (batch_size, num_steps, 1)
-            timesteps = self.sd_pipeline.scheduler.timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
+            timesteps = self.sd_pipeline.scheduler.timesteps[::self.config.chain_len]
+            timesteps = timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
 
+            print(f'latent shape: {latents.shape}')
+            print(f'log_probs shape: {log_probs.shape}')
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
@@ -869,18 +919,8 @@ class RLR_Trainer(BaseTrainer):
             # prompt_image_pairs["images"] = images
             # prompt_image_pairs["prompts"] = prompts
             # prompt_image_pairs["prompt_metadata"] = prompt_metadata
-
-        return samples, prompt_image_pairs
-
-        # orignial code
-        # images = sd_output.images
-        # samples["images"] = images
-        # samples["prompts"] = prompts
-        # samples["prompt_metadata"] = prompt_metadata
-        # samples["all_log_probs"] = sd_output.log_probs
-
-        # return samples
         
+        return samples, prompt_image_pairs
 
     def train(self, epochs: Optional[int] = None):
         """

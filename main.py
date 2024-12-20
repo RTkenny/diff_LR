@@ -26,9 +26,6 @@ class ScriptArguments:
     pretrained_revision: str = field(default="main", metadata={"help": "the pretrained model revision to use"})
     use_lora: bool = field(default=True, metadata={"help": "Whether to use LoRA."})
 
-
-
-
 def image_outputs_logger(image_data, global_step, accelerate_logger):
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -76,11 +73,11 @@ if __name__ == "__main__":
         pretrained_model_revision=script_args.pretrained_revision,
         use_lora=script_args.use_lora,
     )
+
     trainer = RLR_Trainer(
         training_args,
         prompt_fn,
         pipeline,
         image_samples_hook=image_outputs_logger,
     )
-
     trainer.train()

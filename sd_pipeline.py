@@ -27,8 +27,9 @@ def pipeline_step_with_grad(
     height: Optional[int] = None,
     width: Optional[int] = None,
     num_inference_steps: int = 50,
+    chain_length: int = 1,
     guidance_scale: float = 7.5,
-    gradient_checkpoint: bool = True,
+    gradient_checkpoint: bool = True, # original True
     backprop_strategy: str = 'gaussian',
     backprop_kwargs: Dict[str, Any] = None,
     negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -201,6 +202,7 @@ def pipeline_step_with_grad(
     all_log_probs = []
     with pipeline.progress_bar(total=num_inference_steps) as progress_bar:
         for i, t in enumerate(timesteps):
+            temp_eta = 0.0
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, t)
@@ -228,11 +230,9 @@ def pipeline_step_with_grad(
                     return_dict=False,
                 )[0]
             
-            if i < backprop_timestep:
+            if i < backprop_timestep or backprop_timestep == -2 or (i+1) % chain_length == 0: 
                 noise_pred = noise_pred.detach()
-            elif backprop_timestep == -2:
-                # noise_pred = noise_pred.detach()
-                pass
+                temp_eta = eta
 
             # perform guidance
             if do_classifier_free_guidance:
@@ -244,12 +244,13 @@ def pipeline_step_with_grad(
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
             # compute the previous noisy sample x_t -> x_t-1
-            scheduler_output = scheduler_step(pipeline.scheduler, noise_pred, t, latents, eta)
+            scheduler_output = scheduler_step(pipeline.scheduler, noise_pred, t, latents, temp_eta)
             latents = scheduler_output.latents
             log_prob = scheduler_output.log_probs
 
-            all_latents.append(latents)
-            all_log_probs.append(log_prob)
+            if (i+1) % chain_length == 0 or (i+1) == num_inference_steps:
+                all_latents.append(latents)
+                all_log_probs.append(log_prob)
 
             # call the callback, if provided
             if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % pipeline.scheduler.order == 0):

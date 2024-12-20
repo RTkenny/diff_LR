@@ -110,18 +110,20 @@ class RLR_Config:
     aesthetic_target: float = 10
     sample_eta: float = 1.0
     sample_guidance_scale: float = 5.0
+    chain_len: int = 1
     prompt_fn: str = 'simple_animals'
     gradient_estimation_strategy: str = 'gaussian'    # gaussian, uniform, fixed, LR, RL
     backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 49}, 'LR':{None}, 'RL':{None}}
     
     train_batch_size: int = 1
     train_use_8bit_adam: bool = False
-    train_learning_rate: float = 1e-3
+    train_learning_rate: float = 3e-4 # 1e-3 for supervised learning
     train_adam_beta1: float = 0.9
     train_adam_beta2: float = 0.999
     train_adam_weight_decay: float = 1e-4
     train_adam_epsilon: float = 1e-8
     train_gradient_accumulation_steps: int = 1
+    train_zo_sample_budget: int = 1
     train_max_grad_norm: float = 1.0
     negative_prompts: Optional[str] = None
     train_clip_range: float = 1e-4
