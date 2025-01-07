@@ -3,7 +3,7 @@
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
     --num_epochs=100 \
     --train_gradient_accumulation_steps=8 \
-    --backprop_strategy='gaussian' \
+    --gradient_estimation_strategy='gaussian' \
     --sample_num_steps=50 \
     --reward_fn='aesthetic' \
     --prompt_fn='simple_animals' \

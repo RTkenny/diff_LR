@@ -358,50 +358,60 @@ class RLR_Trainer(BaseTrainer):
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
             param.data = param.data + scaling_factor * z * self.zo_eps
 
-    def zo_forward(self, model, data, target, retain_graph=False):
+    def zo_forward(self, model, prompts, prompt_metadata, retain_graph=False):
         """
         Get (no gradient) loss from the model. Dropout is turned off too.
         """
         model.eval()
+        batch_size = len(prompts) # self.config.train_batch_size
+        sample_neg_prompt_embeds = self.neg_prompt_embed.repeat(batch_size, 1, 1)
         if not retain_graph:
             with torch.inference_mode():
-                loss, output = self.compute_loss(model, data, target)
+                sd_output, prompt_ids, prompt_embeds = self._inference_steps(prompts, sample_neg_prompt_embeds, with_grad=False)
+                if "hps" in self.config.reward_fn:
+                    loss, rewards = self.loss_fn(sd_output.images, prompts)
+                else:
+                    loss, rewards = self.loss_fn(sd_output.images)
         else:
-            loss, output = self.compute_loss(model, data, target)
-        return loss.detach(), output
+            sd_output, prompt_ids, prompt_embeds = self._inference_steps(prompts, sample_neg_prompt_embeds, with_grad=False)
+            if "hps" in self.config.reward_fn:
+                loss, rewards = self.loss_fn(sd_output.images, prompts)
+            else:
+                loss, rewards = self.loss_fn(sd_output.images)
+        return loss.detach(), rewards
 
-    def zo_step_all_params(self, model, data, target, sample_budget=1):
-        """
-        Estimate gradient by MeZO. Return the loss from f(theta + z)
-        """
+    # def zo_step_all_params(self, model, data, target, sample_budget=1):
+    #     """
+    #     Estimate gradient by MeZO. Return the loss from f(theta + z)
+    #     """
 
-        # What parameters to optimize 
-        self.named_parameters_to_optim = []
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.named_parameters_to_optim.append((name, param))
+    #     # What parameters to optimize 
+    #     self.named_parameters_to_optim = []
+    #     for name, param in model.named_parameters():
+    #         if param.requires_grad:
+    #             self.named_parameters_to_optim.append((name, param))
 
-        for _ in range(sample_budget):
-            # Sample the random seed for sampling z
-            self.zo_random_seed = np.random.randint(1000000000)
+    #     for _ in range(sample_budget):
+    #         # Sample the random seed for sampling z
+    #         self.zo_random_seed = np.random.randint(1000000000)
 
-            # First function evaluation
-            self.perturb_all_params(scaling_factor=1)
-            loss1, _ = self.zo_forward(model, data, target)
+    #         # First function evaluation
+    #         self.perturb_all_params(scaling_factor=1)
+    #         loss1, _ = self.zo_forward(model, data, target)
 
-            # Second function evaluation
-            self.perturb_all_params(scaling_factor=-2)
-            loss2, _ = self.zo_forward(model, data, target)
+    #         # Second function evaluation
+    #         self.perturb_all_params(scaling_factor=-2)
+    #         loss2, _ = self.zo_forward(model, data, target)
 
-            self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
-            self.projected_grad = self.projected_grad / float(sample_budget)
+    #         self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
+    #         self.projected_grad = self.projected_grad / float(sample_budget)
 
-            # Reset model back to its parameters at start of step
-            self.perturb_all_params(scaling_factor=1)
-            self.zo_backward()
+    #         # Reset model back to its parameters at start of step
+    #         self.perturb_all_params(scaling_factor=1)
+    #         self.zo_backward()
 
-        loss, output = self.zo_forward(model, data, target)
-        return loss, output
+    #     loss, output = self.zo_forward(model, data, target)
+    #     return loss, output
 
     def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
         """
@@ -692,8 +702,8 @@ class RLR_Trainer(BaseTrainer):
                     self.perturb_all_params(scaling_factor=1)
                     self.zo_backward()
 
-
         else:
+            # BP version
             for _ in range(self.config.train_gradient_accumulation_steps):
                 with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
                     samples, prompt_image_pairs = self._generate_samples(
