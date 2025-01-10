@@ -4,6 +4,7 @@
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
     --num_epochs=20 \
     --train_gradient_accumulation_steps=4 \
+    --train_learning_rate=1e-3 \
     --gradient_estimation_strategy='fixed' \
     --sample_num_steps=50 \
     --reward_fn='aesthetic' \

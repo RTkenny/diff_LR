@@ -123,14 +123,17 @@ def pipeline_step_with_grad(
     """
 
     backprop_timestep = -1
-    
+    is_bp = False
     while backprop_timestep >= num_inference_steps or backprop_timestep < 1:    
         if backprop_strategy == 'gaussian':
             backprop_timestep = int(torch.distributions.Normal(backprop_kwargs['mean'], backprop_kwargs['std']).sample().item())
+            is_bp = True
         elif backprop_strategy == 'uniform':
             backprop_timestep = int(torch.randint(backprop_kwargs['min'], backprop_kwargs['max'], (1,)).item())
+            is_bp = True
         elif backprop_strategy == 'fixed':
             backprop_timestep = int(backprop_kwargs['value'])
+            is_bp = True
         else:
             backprop_timestep = -2
             break
@@ -230,7 +233,7 @@ def pipeline_step_with_grad(
                     return_dict=False,
                 )[0]
             
-            if i < backprop_timestep or backprop_timestep == -2 or (i+1) % chain_length == 0: 
+            if i < backprop_timestep or backprop_timestep == -2 or (is_bp==False and (i+1) % chain_length == 0): 
                 noise_pred = noise_pred.detach()
                 temp_eta = eta
 

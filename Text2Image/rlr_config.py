@@ -12,7 +12,7 @@ from trl.core import flatten_dict
 @dataclass
 class RLR_Config:
     r"""
-    Configuration class for the [`AlignPropTrainer`].
+    Configuration class for the [`RLRTrainer`].
 
     Using [`~transformers.HfArgumentParser`] we can turn this class into
     [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
@@ -101,6 +101,7 @@ class RLR_Config:
     allow_tf32: bool = True
     resume_from: str = ""
     sample_num_steps: int = 50
+    zo_eps: float = 1e-3
     sample_num_batches_per_epoch: int = 4
     sample_batch_size: int = 32
     reward_fn: str = 'hps'
@@ -110,14 +111,14 @@ class RLR_Config:
     aesthetic_target: float = 10
     sample_eta: float = 1.0
     sample_guidance_scale: float = 5.0
-    chain_len: int = 1
+    chain_len: int = 1 # chain for one RL steps
     prompt_fn: str = 'simple_animals'
     gradient_estimation_strategy: str = 'gaussian'    # gaussian, uniform, fixed, LR, RL
-    backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 49}, 'LR':{None}, 'RL':{None}}
+    backprop_kwargs = {'gaussian': {'mean': 42, 'std': 5}, 'uniform': {'min': 0, 'max': 50}, 'fixed': {'value': 48}, 'LR':{None}, 'RL':{None}, 'ZO':{None}}
     
     train_batch_size: int = 1
     train_use_8bit_adam: bool = False
-    train_learning_rate: float = 3e-4 # 1e-3 for supervised learning
+    train_learning_rate: float = 1e-3 # 1e-3 for supervised learning; 3e-4 for RL; 1e-6 for ZO
     train_adam_beta1: float = 0.9
     train_adam_beta2: float = 0.999
     train_adam_weight_decay: float = 1e-4

@@ -18,7 +18,7 @@ import numpy as np
 from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
 import torchvision
 from sd_pipeline import DiffusionPipeline
-from config.rlr_config import RLR_Config
+from rlr_config import RLR_Config
 from trl.trainer import BaseTrainer, DDPOTrainer, AlignPropTrainer
 
 
@@ -87,7 +87,7 @@ def hps_loss_fn(inference_dtype=None, device=None):
     model = model.to(device, dtype=inference_dtype)
     model.eval()
 
-    target_size =  224
+    target_size = 224
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                                 std=[0.26862954, 0.26130258, 0.27577711])
         
@@ -198,8 +198,8 @@ class RLR_Trainer(BaseTrainer):
             gradient_accumulation_steps = self.config.train_gradient_accumulation_steps * self.num_train_timesteps
         
         elif self.config.gradient_estimation_strategy == "ZO":
-            gradient_accumulation_steps = self.config.train_zo_sample_budget
-
+            # gradient_accumulation_steps = self.config.train_zo_sample_budget
+            gradient_accumulation_steps = self.config.train_gradient_accumulation_steps
         else:
             gradient_accumulation_steps = self.config.train_gradient_accumulation_steps
         
@@ -255,6 +255,8 @@ class RLR_Trainer(BaseTrainer):
         self.sd_pipeline.unet.to(self.accelerator.device, dtype=inference_dtype)
 
         trainable_layers = self.sd_pipeline.get_trainable_layers()
+        # print(len(trainable_layers))
+        # print(trainable_layers)
 
         self.accelerator.register_save_state_pre_hook(self._save_model_hook)
         self.accelerator.register_load_state_pre_hook(self._load_model_hook)
@@ -356,7 +358,7 @@ class RLR_Trainer(BaseTrainer):
         
         for name, param in self.named_parameters_to_optim:
             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-            param.data = param.data + scaling_factor * z * self.zo_eps
+            param.data = param.data + scaling_factor * z * self.config.zo_eps
 
     def zo_forward(self, model, prompts, prompt_metadata, retain_graph=False):
         """
@@ -378,40 +380,20 @@ class RLR_Trainer(BaseTrainer):
                 loss, rewards = self.loss_fn(sd_output.images, prompts)
             else:
                 loss, rewards = self.loss_fn(sd_output.images)
-        return loss.detach(), rewards
+        return loss.mean().detach(), rewards
 
-    # def zo_step_all_params(self, model, data, target, sample_budget=1):
-    #     """
-    #     Estimate gradient by MeZO. Return the loss from f(theta + z)
-    #     """
+    def zo_backward(self, target_name=None):
+        torch.manual_seed(self.zo_random_seed)     
 
-    #     # What parameters to optimize 
-    #     self.named_parameters_to_optim = []
-    #     for name, param in model.named_parameters():
-    #         if param.requires_grad:
-    #             self.named_parameters_to_optim.append((name, param))
-
-    #     for _ in range(sample_budget):
-    #         # Sample the random seed for sampling z
-    #         self.zo_random_seed = np.random.randint(1000000000)
-
-    #         # First function evaluation
-    #         self.perturb_all_params(scaling_factor=1)
-    #         loss1, _ = self.zo_forward(model, data, target)
-
-    #         # Second function evaluation
-    #         self.perturb_all_params(scaling_factor=-2)
-    #         loss2, _ = self.zo_forward(model, data, target)
-
-    #         self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
-    #         self.projected_grad = self.projected_grad / float(sample_budget)
-
-    #         # Reset model back to its parameters at start of step
-    #         self.perturb_all_params(scaling_factor=1)
-    #         self.zo_backward()
-
-    #     loss, output = self.zo_forward(model, data, target)
-    #     return loss, output
+        for name, param in self.named_parameters_to_optim:
+            if target_name is not None and target_name != name:
+                continue
+            # Resample z
+            z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+            if param.grad is None:
+                param.grad = self.projected_grad * z
+            else:
+                param.grad += self.projected_grad * z
 
     def calculate_loss(self, latents, timesteps, next_latents, log_probs, advantages, embeds):
         """
@@ -681,9 +663,15 @@ class RLR_Trainer(BaseTrainer):
                 if param.requires_grad:
                     self.named_parameters_to_optim.append((name, param))
             
+            print(len(self.named_parameters_to_optim))
             prompts, prompt_metadata = self._collect_data(self.config.train_batch_size)
-            for _ in range(self.config.train_zo_sample_budget):
-                with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(): # torch.no_grad or torch.enable_grad
+            print('prompts')
+            print(prompts)
+
+            
+            with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(): # torch.no_grad or torch.enable_grad
+                print(f'zo_sample_budget: {self.config.train_zo_sample_budget}')
+                for _ in range(self.config.train_zo_sample_budget):
                     # Sample the random seed for sampling z
                     self.zo_random_seed = np.random.randint(1000000000)
 
@@ -695,20 +683,66 @@ class RLR_Trainer(BaseTrainer):
                     self.perturb_all_params(scaling_factor=-2)
                     loss2, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
 
-                    self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
+                    self.projected_grad = ((loss1 - loss2) / (2 * self.config.zo_eps)).item()
                     self.projected_grad = self.projected_grad / float(self.config.train_zo_sample_budget)
-
+    
                     # Reset model back to its parameters at start of step
                     self.perturb_all_params(scaling_factor=1)
                     self.zo_backward()
+                    
 
+                print('after evaluation then grad dtype')
+                print(self.named_parameters_to_optim[0][1].grad.dtype)
+                loss, rewards = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+                try:
+                    self.accelerator.backward(loss)
+                except:
+                    pass
+
+                info["reward_mean"].append(rewards.mean())
+                info["reward_std"].append(rewards.std())
+                info["loss"].append(loss.item())
+
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if self.accelerator.sync_gradients:
+                # log training-related stuff
+                info = {k: torch.mean(torch.tensor(v)) for k, v in info.items()}
+                info.update({"epoch": epoch})
+                self.accelerator.log(info, step=global_step)
+                global_step += 1
+                info = defaultdict(list)
+            else:
+                raise ValueError(
+                    "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
+                )
+            if self.image_samples_callback is not None and global_step % self.config.log_image_freq == 0 and self.accelerator.is_main_process:
+                print("Logging images")
+                # Fix the random seed for reproducibility
+                torch.manual_seed(self.config.seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(self.config.seed)
+                _, prompt_image_pairs = self._generate_samples(
+                        iterations = 1,
+                        batch_size=self.config.train_batch_size,
+                        with_grad=False, 
+                        prompts=self.eval_prompts
+                    )
+                self.image_samples_callback(prompt_image_pairs, global_step, self.accelerator.trackers[0])
+                seed = random.randint(0, 100)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)  
         else:
             # BP version
             for _ in range(self.config.train_gradient_accumulation_steps):
                 with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad():
                     samples, prompt_image_pairs = self._generate_samples(
-                            iterrations = 1,
+                            iterations = 1,
                             batch_size=self.config.train_batch_size,
+                            with_grad=True
                         )
                     prompt_image_data = {}
                     prompt_image_data["images"] = prompt_image_pairs[0][0]
@@ -724,13 +758,12 @@ class RLR_Trainer(BaseTrainer):
                         loss, rewards = self.loss_fn(prompt_image_data["images"])
 
                     rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
-                    loss = loss.mean()
-                    loss = loss * self.config.loss_coeff
 
                     if self.config.gradient_estimation_strategy != "LR":
                         loss = loss.mean()
                         loss = loss * self.config.loss_coeff
                         self.accelerator.backward(loss)
+
                     else:
                         # have problems, originally i want to implement in the policy gradient style 
                         loss = loss.detach()
@@ -779,13 +812,7 @@ class RLR_Trainer(BaseTrainer):
                         with_grad=False, 
                         prompts=self.eval_prompts
                     )
-                
-                prompt_image_data = {}
-                prompt_image_data["images"] = prompt_image_pairs[0][0]
-                prompt_image_data["prompts"] = prompt_image_pairs[0][1]
-                prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
-
-                self.image_samples_callback(prompt_image_data, global_step, self.accelerator.trackers[0])
+                self.image_samples_callback(prompt_image_pairs, global_step, self.accelerator.trackers[0])
                 seed = random.randint(0, 100)
                 torch.manual_seed(seed)
                 if torch.cuda.is_available():
@@ -842,7 +869,7 @@ class RLR_Trainer(BaseTrainer):
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=sample_neg_prompt_embeds,
                 num_inference_steps=self.config.sample_num_steps,
-                chain_len=self.config.chain_len,
+                chain_length=self.config.chain_len,
                 guidance_scale=self.config.sample_guidance_scale,
                 eta=self.config.sample_eta,
                 backprop_strategy=self.config.gradient_estimation_strategy,
@@ -850,7 +877,7 @@ class RLR_Trainer(BaseTrainer):
                 output_type="pt",
             )
         else:
-            # ## version 1
+            ## version 1
             # sd_output = self.sd_pipeline(
             #     prompt_embeds=prompt_embeds,
             #     negative_prompt_embeds=sample_neg_prompt_embeds,
@@ -865,7 +892,7 @@ class RLR_Trainer(BaseTrainer):
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=sample_neg_prompt_embeds,
                 num_inference_steps=self.config.sample_num_steps,
-                chain_len=self.config.chain_len,
+                chain_length=self.config.chain_len,
                 guidance_scale=self.config.sample_guidance_scale,
                 eta=self.config.sample_eta,
                 backprop_strategy=self.config.gradient_estimation_strategy,
@@ -900,7 +927,7 @@ class RLR_Trainer(BaseTrainer):
                 prompts, prompt_metadata = self._collect_data(batch_size)
             else:
                 prompt_metadata = [{} for _ in range(batch_size)]
-
+            print(f'prompts: {prompts}')
             sd_output, prompt_ids, prompt_embeds = self._inference_steps(prompts, sample_neg_prompt_embeds, with_grad)
 
             images = sd_output.images
@@ -912,8 +939,8 @@ class RLR_Trainer(BaseTrainer):
             timesteps = self.sd_pipeline.scheduler.timesteps[::self.config.chain_len]
             timesteps = timesteps.repeat(batch_size, 1)  # (batch_size, num_steps)
 
-            print(f'latent shape: {latents.shape}')
-            print(f'log_probs shape: {log_probs.shape}')
+            # print(f'latent shape: {latents.shape}')
+            # print(f'log_probs shape: {log_probs.shape}')
             samples.append(
                 {
                     "prompt_ids": prompt_ids,

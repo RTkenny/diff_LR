@@ -1,0 +1,13 @@
+CUDA_VISIBLE_DEVICES=1 accelerate launch main.py \
+    --num_epochs=50 \
+    --train_gradient_accumulation_steps=1 \
+    --sample_eta=0.0 \
+    --train_learning_rate=2e-3 \
+    --train_zo_sample_budget=6 \
+    --gradient_estimation_strategy='ZO' \
+    --sample_num_steps=50 \
+    --reward_fn='aesthetic' \
+    --prompt_fn='simple_animals' \
+    --train_batch_size=4 \
+    --tracker_project_name="stable_diffusion_training" \
+    --log_with="wandb"

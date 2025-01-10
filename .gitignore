@@ -3,3 +3,31 @@ logs/
 .vscode
 *.pyc
 checkpoints/
+
+**/__pycache__
+**/*.pyc
+**/*.log
+**/*.png
+**/*.jpg
+**/*.mp4
+# /HPSv2/*.egg-info
+HPSv2
+**/HPSv2
+
+# Text2Video
+Text2Video/.DS_Store
+Text2Video/.vscode
+Text2Video/__pycache__
+Text2Video/*.egg-info
+Text2Video/checkpoints
+Text2Video/results
+Text2Video/wandb
+Text2Video/project_dir
+Text2Video/scripts/evaluation/__pycache__
+Text2Video/scripts/lvdm/__pycache__
+
+# Text2Image
+Text2Image/.vscode
+Text2Image/__pycache__
+Text2Image/checkpoints
+Text2Image/wandb
