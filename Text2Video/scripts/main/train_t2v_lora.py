@@ -575,7 +575,7 @@ def run_training(args, **kwargs):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.logger_type,
-        project_dir=args.project_dir
+        project_dir=args.project_dirl
     )
     output_dir = args.project_dir
 

@@ -22,7 +22,6 @@ class MLPDiff(nn.Module):
             nn.Linear(16, 1),
         )
 
-
     def forward(self, embed):
         return self.layers(embed)
 

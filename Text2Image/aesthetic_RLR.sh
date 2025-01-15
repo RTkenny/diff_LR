@@ -1,10 +1,11 @@
-CUDA_VISIBLE_DEVICES=1 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=2 accelerate launch main.py \
     --num_epochs=50 \
     --train_gradient_accumulation_steps=1 \
     --sample_eta=0.0 \
-    --train_learning_rate=2e-3 \
-    --train_zo_sample_budget=6 \
-    --gradient_estimation_strategy='ZO' \
+    --train_learning_rate=1e-3 \
+    --train_zo_sample_budget=0 \
+    --gradient_estimation_strategy='RLR' \
+    --pure_ZO=False \
     --sample_num_steps=50 \
     --reward_fn='aesthetic' \
     --prompt_fn='simple_animals' \

@@ -55,7 +55,7 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, RLR_Config))
     script_args, training_args = parser.parse_args_into_dataclasses()
-    project_dir = f"alignprop_{int(time.time())}"
+    project_dir = f"RLR_{int(time.time())}"
     os.makedirs(f"checkpoints/{project_dir}", exist_ok=True)
     
     training_args.project_kwargs = {
@@ -73,10 +73,10 @@ if __name__ == "__main__":
         use_lora=script_args.use_lora,
     )
     print(training_args.log_with)
-    # trainer = RLR_Trainer(
-    #     training_args,
-    #     prompt_fn,
-    #     pipeline,
-    #     image_samples_hook=image_outputs_logger,
-    # )
-    # trainer.train()
+    trainer = RLR_Trainer(
+        training_args,
+        prompt_fn,
+        pipeline,
+        image_samples_hook=image_outputs_logger,
+    )
+    trainer.train()

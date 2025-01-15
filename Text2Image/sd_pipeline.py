@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.utils.checkpoint as checkpoint
-from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel, schedulers
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import rescale_noise_cfg
 from transformers.utils import is_peft_available
 
@@ -45,6 +45,7 @@ def pipeline_step_with_grad(
     callback_steps: int = 1,
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     guidance_rescale: float = 0.0,
+    cache_latents: bool = False,
 ):
     r"""
     Function to get RGB image with gradients attached to the model weights.
@@ -131,7 +132,7 @@ def pipeline_step_with_grad(
         elif backprop_strategy == 'uniform':
             backprop_timestep = int(torch.randint(backprop_kwargs['min'], backprop_kwargs['max'], (1,)).item())
             is_bp = True
-        elif backprop_strategy == 'fixed':
+        elif backprop_strategy == 'fixed' or backprop_strategy == 'RLR':
             backprop_timestep = int(backprop_kwargs['value'])
             is_bp = True
         else:
@@ -210,10 +211,6 @@ def pipeline_step_with_grad(
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
             latent_model_input = pipeline.scheduler.scale_model_input(latent_model_input, t)
 
-            if backprop_timestep == -2:
-                # latent_model_input = latent_model_input.detach()
-                pass
-
             # predict the noise residual
             if gradient_checkpoint:
                 noise_pred = checkpoint.checkpoint(
@@ -268,11 +265,21 @@ def pipeline_step_with_grad(
         image = latents
         has_nsfw_concept = None
 
-    if has_nsfw_concept is None:
-        do_denormalize = [True] * image.shape[0]
-    else:
-        do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+    # if has_nsfw_concept is None:
+    #     do_denormalize = [True] * image.shape[0]
+    # else:
+    #     do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+
+    do_denormalize = [True] * image.shape[0]
     image = pipeline.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+
+    if cache_latents:
+        tmp = []
+        for i, tmp_latent in enumerate(all_latents):
+            latent_image = pipeline.vae.decode(tmp_latent / pipeline.vae.config.scaling_factor, return_dict=False)[0]
+            latent_image = pipeline.image_processor.postprocess(latent_image, output_type='pil', do_denormalize=do_denormalize)
+            tmp.append(latent_image)
+        all_latents = tmp
 
     # Offload last model to CPU
     if hasattr(pipeline, "final_offload_hook") and pipeline.final_offload_hook is not None:

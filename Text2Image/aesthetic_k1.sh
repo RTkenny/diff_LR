@@ -1,7 +1,7 @@
 # i have tested the code with 128 batch size, i.e 4 gpus x 8 batch size x 4 gradient accumulation steps, however you can change the batch size 
 # or batch size division as per your requirements
 # original batch size = 8
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=0 accelerate launch main.py \
     --num_epochs=20 \
     --train_gradient_accumulation_steps=4 \
     --train_learning_rate=1e-3 \

@@ -1,26 +1,20 @@
 import os
+import time
 import textwrap
 import random
+import torch
+import numpy as np
 from collections import defaultdict
 from typing import Any, Callable, List, Optional, Tuple, Union
 from warnings import warn
-import time
-import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from aesthetic_scorer import AestheticScorerDiff
-import tempfile
-from PIL import Image
 from accelerate.utils import ProjectConfiguration, set_seed
 from transformers import is_wandb_available
-import hpsv2
-import numpy as np
-from hpsv2.src.open_clip import create_model_and_transforms, get_tokenizer
-import torchvision
 from sd_pipeline import DiffusionPipeline
 from rlr_config import RLR_Config
 from trl.trainer import BaseTrainer, DDPOTrainer, AlignPropTrainer
-
+from loss_fn import hps_loss_fn, aesthetic_loss_fn, aesthetic_hps_loss_fn
 
 if is_wandb_available():
     import wandb
@@ -28,120 +22,14 @@ if is_wandb_available():
 logger = get_logger(__name__)
 
 
-def hps_loss_fn(inference_dtype=None, device=None):
-    model_name = "ViT-H-14"
-    model, preprocess_train, preprocess_val = create_model_and_transforms(
-        model_name,
-        'laion2B-s32B-b79K',
-        precision=inference_dtype,
-        device=device,
-        jit=False,
-        force_quick_gelu=False,
-        force_custom_text=False,
-        force_patch_dropout=False,
-        force_image_size=None,
-        pretrained_image=False,
-        image_mean=None,
-        image_std=None,
-        light_augmentation=True,
-        aug_cfg={},
-        output_dict=True,
-        with_score_predictor=False,
-        with_region_predictor=False
-    )    
-    
-    tokenizer = get_tokenizer(model_name)
-    
-    link = "https://huggingface.co/spaces/xswu/HPSv2/resolve/main/HPS_v2_compressed.pt"
-    import os
-    import requests
-    from tqdm import tqdm
-
-    # Create the directory if it doesn't exist
-    os.makedirs(os.path.expanduser('~/.cache/hpsv2'), exist_ok=True)
-    checkpoint_path = f"{os.path.expanduser('~')}/.cache/hpsv2/HPS_v2_compressed.pt"
-
-    # Download the file if it doesn't exist
-    if not os.path.exists(checkpoint_path):
-        response = requests.get(link, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
-
-        with open(checkpoint_path, 'wb') as file, tqdm(
-            desc="Downloading HPS_v2_compressed.pt",
-            total=total_size,
-            unit='iB',
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress_bar:
-            for data in response.iter_content(chunk_size=1024):
-                size = file.write(data)
-                progress_bar.update(size)
-    
-    
-    # force download of model via score
-    hpsv2.score([], "")
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['state_dict'])
-    tokenizer = get_tokenizer(model_name)
-    model = model.to(device, dtype=inference_dtype)
-    model.eval()
-
-    target_size = 224
-    normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                                std=[0.26862954, 0.26130258, 0.27577711])
-        
-    def loss_fn(im_pix, prompts):    
-        im_pix = ((im_pix / 2) + 0.5).clamp(0, 1) 
-        x_var = torchvision.transforms.Resize(target_size)(im_pix)
-        x_var = normalize(x_var).to(im_pix.dtype)        
-        caption = tokenizer(prompts)
-        caption = caption.to(device)
-        outputs = model(x_var, caption)
-        image_features, text_features = outputs["image_features"], outputs["text_features"]
-        logits = image_features @ text_features.T
-        scores = torch.diagonal(logits)
-        loss = 1.0 - scores
-        return  loss, scores
-    
-    return loss_fn
-    
-
-def aesthetic_loss_fn(aesthetic_target=None,
-                     grad_scale=0,
-                     device=None,
-                     accelerator=None,
-                     torch_dtype=None):
-    
-    target_size = 224
-    normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
-                                                std=[0.26862954, 0.26130258, 0.27577711])
-    scorer = AestheticScorerDiff(dtype=torch_dtype).to(device, dtype=torch_dtype)
-    scorer.requires_grad_(False)
-    target_size = 224
-    def loss_fn(im_pix_un):
-        im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
-        im_pix = torchvision.transforms.Resize(target_size)(im_pix)
-        im_pix = normalize(im_pix).to(im_pix_un.dtype)
-        rewards = scorer(im_pix)
-        if aesthetic_target is None: # default maximization
-            loss = -1 * rewards
-        else:
-            # using L1 to keep on same scale
-            loss = abs(rewards - aesthetic_target)
-        return loss * grad_scale, rewards
-    return loss_fn
-
-
 class RLR_Trainer(BaseTrainer):
     """
-    The AlignPropTrainer uses Deep Diffusion Policy Optimization to optimise diffusion models.
-    Note, this trainer is heavily inspired by the work here: https://github.com/mihirp1998/AlignProp/
+    The RLRTrainer combines zeroth-order and first-order optimization to train a Stable Diffusion model.
     As of now only Stable Diffusion based pipelines are supported
 
     Attributes:
-        config (`AlignPropConfig`):
-            Configuration object for AlignPropTrainer. Check the documentation of `PPOConfig` for more details.
+        config (`RLRConfig`):
+            Configuration object for RLRTrainer. Check the documentation of `PPOConfig` for more details.
         reward_function (`Callable[[torch.Tensor, Tuple[str], Tuple[Any]], torch.Tensor]`):
             Reward function to be used
         prompt_function (`Callable[[], Tuple[str, Any]]`):
@@ -152,7 +40,7 @@ class RLR_Trainer(BaseTrainer):
             Hook to be called to log images
     """
 
-    _tag_names = ["trl", "alignprop"]
+    _tag_names = ["trl", "RLR"]
 
     def __init__(
         self,
@@ -197,7 +85,7 @@ class RLR_Trainer(BaseTrainer):
         if self.config.gradient_estimation_strategy == "RL":
             gradient_accumulation_steps = self.config.train_gradient_accumulation_steps * self.num_train_timesteps
         
-        elif self.config.gradient_estimation_strategy == "ZO":
+        elif self.config.gradient_estimation_strategy == "RLR":
             # gradient_accumulation_steps = self.config.train_zo_sample_budget
             gradient_accumulation_steps = self.config.train_gradient_accumulation_steps
         else:
@@ -293,11 +181,19 @@ class RLR_Trainer(BaseTrainer):
         if self.config.reward_fn=='hps':
             self.loss_fn = hps_loss_fn(inference_dtype, self.accelerator.device)
         elif self.config.reward_fn=='aesthetic': # easthetic
-            self.loss_fn = aesthetic_loss_fn(grad_scale=self.config.grad_scale,
-                                        aesthetic_target=self.config.aesthetic_target,
-                                        accelerator = self.accelerator,
-                                        torch_dtype = inference_dtype,
-                                        device = self.accelerator.device)
+            self.loss_fn = aesthetic_loss_fn(
+                grad_scale=self.config.grad_scale,
+                aesthetic_target=self.config.aesthetic_target,
+                torch_dtype = inference_dtype,
+                device = self.accelerator.device
+            )
+        elif self.config.reward_fn=='hps_aesthetic':
+            self.loss_fn = aesthetic_hps_loss_fn(
+                aesthetic_target=self.config.aesthetic_target,
+                grad_scale=self.config.grad_scale,
+                inference_dtype = inference_dtype,
+                device = self.accelerator.device
+            )
         else:
             raise NotImplementedError
         if config.resume_from:
@@ -307,7 +203,7 @@ class RLR_Trainer(BaseTrainer):
         else:
             self.first_epoch = 0
         
-        self.eval_prompts, self.eval_prompt_metadata = zip(*[self.prompt_fn() for _ in range(config.train_batch_size)])
+        self.eval_prompts, self.eval_prompt_metadata = zip(*[self.prompt_fn() for _ in range(config.eval_batch_size)])
 
     def reward_fn_RL(self, images, prompts, prompt_metadata):
         """
@@ -380,6 +276,7 @@ class RLR_Trainer(BaseTrainer):
                 loss, rewards = self.loss_fn(sd_output.images, prompts)
             else:
                 loss, rewards = self.loss_fn(sd_output.images)
+        model.train()
         return loss.mean().detach(), rewards
 
     def zo_backward(self, target_name=None):
@@ -657,54 +554,82 @@ class RLR_Trainer(BaseTrainer):
                         "Optimization step should have been performed by this point. Please check calculated gradient accumulation settings."
                     )
         
-        elif self.config.gradient_estimation_strategy == "ZO":
+        elif self.config.gradient_estimation_strategy == "RLR":
             self.named_parameters_to_optim = []
             for name, param in self.sd_pipeline.unet.named_parameters():
                 if param.requires_grad:
                     self.named_parameters_to_optim.append((name, param))
             
-            print(len(self.named_parameters_to_optim))
             prompts, prompt_metadata = self._collect_data(self.config.train_batch_size)
-            print('prompts')
-            print(prompts)
+            # print(len(self.named_parameters_to_optim))
+            # print('prompts')
+            # print(prompts)
 
-            
-            with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(): # torch.no_grad or torch.enable_grad
-                print(f'zo_sample_budget: {self.config.train_zo_sample_budget}')
-                for _ in range(self.config.train_zo_sample_budget):
-                    # Sample the random seed for sampling z
-                    self.zo_random_seed = np.random.randint(1000000000)
+            for _ in range(self.config.train_gradient_accumulation_steps):
+                with self.accelerator.accumulate(self.sd_pipeline.unet), self.autocast(), torch.enable_grad(): # torch.no_grad or torch.enable_grad
+                    print(f'zo_sample_budget: {self.config.train_zo_sample_budget}')
+                    for _ in range(self.config.train_zo_sample_budget):
+                        # Sample the random seed for sampling z
+                        self.zo_random_seed = np.random.randint(1000000000)
 
-                    # First function evaluation
-                    self.perturb_all_params(scaling_factor=1)
-                    loss1, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+                        # First function evaluation
+                        self.perturb_all_params(scaling_factor=1)
+                        loss1, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
 
-                    # Second function evaluation
-                    self.perturb_all_params(scaling_factor=-2)
-                    loss2, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+                        # Second function evaluation
+                        self.perturb_all_params(scaling_factor=-2)
+                        loss2, _ = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
 
-                    self.projected_grad = ((loss1 - loss2) / (2 * self.config.zo_eps)).item()
-                    self.projected_grad = self.projected_grad / float(self.config.train_zo_sample_budget)
-    
-                    # Reset model back to its parameters at start of step
-                    self.perturb_all_params(scaling_factor=1)
-                    self.zo_backward()
+                        self.projected_grad = ((loss1 - loss2) * self.config.zo_loss_coeff / (2 * self.config.zo_eps)).item()
+                        self.projected_grad = self.projected_grad / float(self.config.train_zo_sample_budget)
+        
+                        # Reset model back to its parameters at start of step
+                        self.perturb_all_params(scaling_factor=1)
+                        self.zo_backward()
+                        
+                    # print('after evaluation then grad dtype')
+                    # print(self.named_parameters_to_optim[0][1].grad.dtype)
+                    # print('after zo backward')
+                    if self.config.pure_ZO:
+                        loss, rewards = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
+                        try:
+                            self.accelerator.backward(loss)
+                        except:
+                            pass
                     
+                    
+                    else:
+                        samples, prompt_image_pairs = self._generate_samples(
+                                    iterations = 1,
+                                    batch_size=self.config.train_batch_size,
+                                    with_grad=True,
+                                    prompts=prompts
+                                )
+                        prompt_image_data = {}
+                        prompt_image_data["images"] = prompt_image_pairs[0][0]
+                        prompt_image_data["prompts"] = prompt_image_pairs[0][1]
+                        prompt_image_data["prompt_metadata"] = prompt_image_pairs[0][2]
 
-                print('after evaluation then grad dtype')
-                print(self.named_parameters_to_optim[0][1].grad.dtype)
-                loss, rewards = self.zo_forward(self.sd_pipeline.unet, prompts, prompt_metadata)
-                try:
-                    self.accelerator.backward(loss)
-                except:
-                    pass
+                        print("Samples generated")
+                        samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
-                info["reward_mean"].append(rewards.mean())
-                info["reward_std"].append(rewards.std())
-                info["loss"].append(loss.item())
+                        if "hps" in self.config.reward_fn:
+                            loss, rewards = self.loss_fn(prompt_image_data["images"], prompt_image_data["prompts"])
+                        else:
+                            loss, rewards = self.loss_fn(prompt_image_data["images"])
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                        rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
+
+                        loss = loss.mean()
+                        loss = loss * self.config.loss_coeff
+                        self.accelerator.backward(loss)
+
+                    info["reward_mean"].append(rewards.mean())
+                    info["reward_std"].append(rewards.std())
+                    info["loss"].append(loss.item())
+
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if self.accelerator.sync_gradients:
@@ -726,7 +651,7 @@ class RLR_Trainer(BaseTrainer):
                     torch.cuda.manual_seed_all(self.config.seed)
                 _, prompt_image_pairs = self._generate_samples(
                         iterations = 1,
-                        batch_size=self.config.train_batch_size,
+                        batch_size=8, # self.config.train_batch_size
                         with_grad=False, 
                         prompts=self.eval_prompts
                     )
@@ -808,7 +733,7 @@ class RLR_Trainer(BaseTrainer):
                     torch.cuda.manual_seed_all(self.config.seed)
                 _, prompt_image_pairs = self._generate_samples(
                         iterations = 1,
-                        batch_size=self.config.train_batch_size,
+                        batch_size=self.config.eval_batch_size,
                         with_grad=False, 
                         prompts=self.eval_prompts
                     )
@@ -927,7 +852,7 @@ class RLR_Trainer(BaseTrainer):
                 prompts, prompt_metadata = self._collect_data(batch_size)
             else:
                 prompt_metadata = [{} for _ in range(batch_size)]
-            print(f'prompts: {prompts}')
+            # print(f'prompts: {prompts}')
             sd_output, prompt_ids, prompt_embeds = self._inference_steps(prompts, sample_neg_prompt_embeds, with_grad)
 
             images = sd_output.images
@@ -953,9 +878,6 @@ class RLR_Trainer(BaseTrainer):
                 }
             )
             prompt_image_pairs.append([images, prompts, prompt_metadata])
-            # prompt_image_pairs["images"] = images
-            # prompt_image_pairs["prompts"] = prompts
-            # prompt_image_pairs["prompt_metadata"] = prompt_metadata
         
         return samples, prompt_image_pairs
 
