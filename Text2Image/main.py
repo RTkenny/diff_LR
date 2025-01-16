@@ -2,6 +2,7 @@ import ipdb
 st = ipdb.set_trace
 import builtins
 import time
+import datetime
 import os
 builtins.st = ipdb.set_trace
 from dataclasses import dataclass, field
@@ -55,7 +56,12 @@ def image_outputs_logger(image_data, global_step, accelerate_logger):
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, RLR_Config))
     script_args, training_args = parser.parse_args_into_dataclasses()
-    project_dir = f"RLR_{int(time.time())}"
+    unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
+    # if not config.run_name:
+    #     config.run_name = unique_id
+    # else:
+    #     config.run_name += "_" + unique_id
+    project_dir = f"{unique_id}_{training_args.reward_fn}_{training_args.gradient_estimation_strategy}_seed_{training_args.seed}"
     os.makedirs(f"checkpoints/{project_dir}", exist_ok=True)
     
     training_args.project_kwargs = {
@@ -65,6 +71,7 @@ if __name__ == "__main__":
         "project_dir": f"checkpoints/{project_dir}",
     }
 
+    training_args.tracker_kwargs = {"wandb": {"name": f"{unique_id}_{training_args.reward_fn}_{training_args.gradient_estimation_strategy}_seed_{training_args.seed}"}}
     prompt_fn = getattr(prompts_file, training_args.prompt_fn)
     
     pipeline = DiffusionPipeline(

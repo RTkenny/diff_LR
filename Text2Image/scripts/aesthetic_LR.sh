@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=0 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=0 accelerate launch ./scripts/main.py \
     --num_epochs=200 \
     --train_gradient_accumulation_steps=2 \
     --gradient_estimation_strategy='LR' \

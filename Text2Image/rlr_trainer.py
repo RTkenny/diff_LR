@@ -14,7 +14,7 @@ from transformers import is_wandb_available
 from sd_pipeline import DiffusionPipeline
 from rlr_config import RLR_Config
 from trl.trainer import BaseTrainer, DDPOTrainer, AlignPropTrainer
-from loss_fn import hps_loss_fn, aesthetic_loss_fn, aesthetic_hps_loss_fn
+from loss_fn import hps_loss_fn, aesthetic_loss_fn, aesthetic_hps_loss_fn, pick_score_loss_fn
 
 if is_wandb_available():
     import wandb
@@ -194,6 +194,11 @@ class RLR_Trainer(BaseTrainer):
                 inference_dtype = inference_dtype,
                 device = self.accelerator.device
             )
+        elif self.config.reward_fn=='pickscore':
+            self.loss_fn = pick_score_loss_fn(
+                inference_dtype = inference_dtype,
+                device = self.accelerator.device
+            )
         else:
             raise NotImplementedError
         if config.resume_from:
@@ -220,7 +225,7 @@ class RLR_Trainer(BaseTrainer):
         Returns:
             reward (torch.Tensor), reward_metadata (Any)
         """
-        if self.config.reward_fn == "hps":
+        if "hps" in self.config.reward_fn:
             loss, rewards = self.loss_fn(images, prompts)
             return rewards, {}
         elif self.config.reward_fn == "aesthetic":
@@ -586,6 +591,7 @@ class RLR_Trainer(BaseTrainer):
                         # Reset model back to its parameters at start of step
                         self.perturb_all_params(scaling_factor=1)
                         self.zo_backward()
+                        print('after zo backward')
                         
                     # print('after evaluation then grad dtype')
                     # print(self.named_parameters_to_optim[0][1].grad.dtype)
@@ -677,10 +683,10 @@ class RLR_Trainer(BaseTrainer):
                     print("Samples generated")
                     samples = {k: torch.cat([s[k] for s in samples]) for k in samples[0].keys()}
 
-                    if "hps" in self.config.reward_fn:
-                        loss, rewards = self.loss_fn(prompt_image_data["images"], prompt_image_data["prompts"])
-                    else:
+                    if "aesthetic" in self.config.reward_fn:
                         loss, rewards = self.loss_fn(prompt_image_data["images"])
+                    else:
+                        loss, rewards = self.loss_fn(prompt_image_data["images"], prompt_image_data["prompts"])
 
                     rewards = self.accelerator.gather(rewards).detach().cpu().numpy()
 

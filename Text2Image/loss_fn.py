@@ -198,7 +198,7 @@ def aesthetic_hps_loss_fn(aesthetic_target=None,
         hps_loss = hps_loss.mean()
         hps_rewards = scores.mean()
 
-        loss = (1.5 * aesthetic_loss + hps_loss) /2  # 1.5 is a hyperparameter. Set it to 1.5 because experimentally hps_loss is 1.5 times larger than aesthetic_loss
+        loss = (1.3 * aesthetic_loss + hps_loss) /2  # 1.5 is a hyperparameter. Set it to 1.5 because experimentally hps_loss is 1.5 times larger than aesthetic_loss
         rewards = (aesthetic_rewards + 15 * hps_rewards) / 2    # 15 is a hyperparameter. Set it to 15 because experimentally aesthetic_rewards is 15 times larger than hps_reward
         return loss, rewards
     

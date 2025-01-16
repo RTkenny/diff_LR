@@ -1,9 +1,9 @@
-CUDA_VISIBLE_DEVICES=2 accelerate launch main.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
     --num_epochs=50 \
-    --train_gradient_accumulation_steps=1 \
+    --train_gradient_accumulation_steps=2 \
     --sample_eta=0.0 \
     --train_learning_rate=1e-3 \
-    --train_zo_sample_budget=0 \
+    --train_zo_sample_budget=1 \
     --gradient_estimation_strategy='RLR' \
     --pure_ZO=False \
     --sample_num_steps=50 \

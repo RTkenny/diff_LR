@@ -1,0 +1,10 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch main.py \
+    --num_epochs=500 \
+    --train_gradient_accumulation_steps=6 \
+    --gradient_estimation_strategy='gaussian' \
+    --sample_num_steps=50 \
+    --reward_fn='pickscore' \
+    --prompt_fn='hps_v2_all' \
+    --train_batch_size=3 \
+    --tracker_project_name="stable_diffusion_training" \
+    --log_with="wandb"
